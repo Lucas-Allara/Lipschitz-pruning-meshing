@@ -1,0 +1,179 @@
+// One level of the octree on the GPU: every invocation takes one child of a cell of the parent
+// level, prunes the tree of the parent for the ball of the child (Procedures 1 and 2 of
+// Barbier et al. 2025, as in include/lpm/tree.h) and, when the child may contain the surface,
+// appends the child and its pruned tree to the output arrays. Everything is evaluated in double
+// precision, like the CPU code, so both builds produce the same trees. Compiled with -DINTERVAL,
+// Procedure 1 is the interval test of prune_interval instead: bounds of every node over the box
+// of the child, and the child is kept when the bound of the root contains zero.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 64) in;
+// Size of the evaluation stack: the maximum stack depth of the full tree, which bounds the one of
+// every pruned tree.
+layout(constant_id = 0) const int STACK = 16;
+
+#include "prune_common.glsl"
+
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    // Children of parents with large trees are left to prune_wide.comp; coarse leaves have none.
+    const bool valid = tid < 8u * pc.n_parents && in_cells[tid >> 3].tree.y <= pc.wide &&
+                       in_cells[tid >> 3].xyz.w != COARSE_LEAF;
+    bool keep = false, far = false;
+    uint count = 0u, prim_evals = 0u, op_evals = 0u;
+    uint off = 0u, n = 0u, sbase = 0u;
+    uvec3 cc = uvec3(0u);
+    if (valid) {
+        const uint child = tid & 7u;
+        const Cell parent = in_cells[tid >> 3];
+        cc = child_cell(parent.xyz.xyz, child);
+        off = parent.tree.x;
+        n = parent.tree.y;
+        sbase = 8u * off + child * n;  // the scratch of the children of a cell follows its tree
+
+#ifdef INTERVAL
+        // Procedure 1 with intervals: an operator is skipped when the bounds of its operands
+        // prove that one of them wins on the whole box, beyond the blending radius.
+        dvec2 bx, by, bz;
+        child_box(cc, bx, by, bz);
+        dvec2 st[STACK];
+        uint si[STACK];
+        int sp = 0;
+        for (uint i = 0u; i < n; i++) {
+            const uint e = 3u * (off + i);
+            const uvec2 nd = nodes[in_pool[e]];
+            dvec2 d;
+            uint state = ACTIVE;
+            if (nd.x == NODE_PRIM) {
+                d = inflate(eval_primitive_iv(nd.y, bx, by, bz));
+                prim_evals++;
+            } else {
+                sp--; const dvec2 B = st[sp]; const uint ri = si[sp];
+                sp--; const dvec2 A = st[sp]; const uint li = si[sp];
+                const dvec4 op = ops[nd.y];
+                d = eval_op_iv(op, A, B);
+                op_evals++;
+                const bool a_below = A.y + op.x <= B.x, b_below = B.y + op.x <= A.x;
+                if (a_below || b_below) {
+                    state = SKIPPED;
+                    if (op.y > 0.0 ? a_below : b_below) scratch[sbase + ri].x = INACTIVE;
+                    else scratch[sbase + li].x = INACTIVE;
+                }
+            }
+            scratch[sbase + i].x = state;
+            st[sp] = (in_pool[e + 2u] & 0xffu) == 0xffu ? iv_neg(d) : d;
+            si[sp] = i;
+            sp++;
+        }
+        keep = st[0].x <= 0.0 && 0.0 <= st[0].y;
+#else
+        const dvec3 center = child_center(cc);
+        // Procedure 1: local state of every node, in one post-order evaluation at the center.
+        double st[STACK];
+        uint si[STACK];
+        int sp = 0;
+        for (uint i = 0u; i < n; i++) {
+            const uint e = 3u * (off + i);
+            const uvec2 nd = nodes[in_pool[e]];
+            double d;
+            uint state = ACTIVE;
+            if (nd.x == NODE_PRIM) {
+                d = eval_primitive(nd.y, center);
+                prim_evals++;
+            } else {
+                sp--; const double b = st[sp]; const uint ri = si[sp];
+                sp--; const double a = st[sp]; const uint li = si[sp];
+                const dvec4 op = ops[nd.y];
+                d = eval_op(op, a, b);
+                op_evals++;
+                if (pc.full == 0u && abs(a - b) > op.x + 2.0 * pc.r_prune) {
+                    state = SKIPPED;
+                    if (op.y * a < op.y * b) scratch[sbase + ri].x = INACTIVE;
+                    else scratch[sbase + li].x = INACTIVE;
+                }
+            }
+            if (pc.full == 0u) scratch[sbase + i].x = state;
+            st[sp] = (in_pool[e + 2u] & 0xffu) == 0xffu ? -d : d;
+            si[sp] = i;
+            sp++;
+        }
+        keep = abs(st[0]) <= pc.r_keep;
+#endif
+        far = !keep && pc.keep_empty != 0u && pc.full == 0u;
+
+        // Procedure 2: global state, new parents and signs, in reverse post-order.
+        if (keep && pc.full != 0u) count = n;
+        if ((keep || far) && pc.full == 0u) {
+            for (int i = int(n) - 1; i >= 0; i--) {
+                const uint state = scratch[sbase + i].x & STATE_MASK;
+                if (state == INACTIVE) {
+                    scratch[sbase + i] = uvec2(INACTIVE | INACTIVE_ANC, NO_PARENT);
+                    continue;
+                }
+                const uint e = 3u * (off + uint(i));
+                const uint pi = in_pool[e + 1u];
+                bool negative = (in_pool[e + 2u] & 0xffu) == 0xffu;
+                uint np = pi;
+                bool inactive_anc = false;
+                if (pi != NO_PARENT) {
+                    const uvec2 ps = scratch[sbase + pi];
+                    inactive_anc = (ps.x & INACTIVE_ANC) != 0u;
+                    if ((ps.x & STATE_MASK) == SKIPPED) {
+                        negative = negative != ((ps.x & NEGATIVE) != 0u);
+                        np = ps.y;
+                    }
+                }
+                const bool active_global = state == ACTIVE && !inactive_anc;
+                scratch[sbase + i] = uvec2(state | (inactive_anc ? INACTIVE_ANC : 0u) |
+                                           (active_global ? ACTIVE_GLOBAL : 0u) | (negative ? NEGATIVE : 0u), np);
+                if (active_global) count++;
+            }
+        }
+    }
+
+    // Space in the output arrays, one atomic per subgroup (all invocations reach this point).
+    const uint want_cell = keep ? 1u : 0u, want_far = far ? 1u : 0u, want = keep ? count : 0u;
+    const uint entries = pc.full != 0u ? 0u : (keep || far ? count : 0u);  // without pruning the cells share the full tree
+    const uint cell_prefix = subgroupExclusiveAdd(want_cell), cell_total = subgroupAdd(want_cell);
+    const uint far_prefix = subgroupExclusiveAdd(want_far), far_total = subgroupAdd(want_far);
+    const uint prefix = subgroupExclusiveAdd(entries), total = subgroupAdd(entries);
+    const uint sub_prims = subgroupAdd(prim_evals), sub_ops = subgroupAdd(op_evals);
+    const uint sub_max = subgroupMax(want), sub_single = subgroupAdd(keep && count == 1u ? 1u : 0u);
+    uint cell_base = 0u, base = 0u, far_base = 0u;
+    if (subgroupElect()) {
+        cell_base = atomicAdd(counters.cells, cell_total);
+        if (far_total > 0u) far_base = atomicAdd(counters.far_cells, far_total);
+        base = atomicAdd(counters.entries, total);
+        atomicMax(counters.max_tree, sub_max);
+        atomicAdd(counters.single_prim, sub_single);
+        atomicAdd(counters.prim_evals, uint64_t(sub_prims));
+        atomicAdd(counters.op_evals, uint64_t(sub_ops));
+    }
+    cell_base = subgroupBroadcastFirst(cell_base) + cell_prefix;
+    base = subgroupBroadcastFirst(base) + prefix;
+    far_base = subgroupBroadcastFirst(far_base) + far_prefix;
+
+    if (valid && keep && pc.full != 0u) out_cells[cell_base] = Cell(uvec4(cc, 0u), uvec4(0u, n, 0u, 0u));
+    if (valid && (keep || far) && pc.full == 0u) {
+        if (keep) out_cells[cell_base] = Cell(uvec4(cc, 0u), uvec4(base, count, 0u, 0u));
+        else out_far[far_base] = Cell(uvec4(cc, 1u), uvec4(base, count, 0u, 0u));
+        // Compaction: the surviving entries keep their post-order; the y field of the scratch is
+        // replaced by the index in the output once an entry is written (its children come later).
+        uint out_index = count;
+        for (int i = int(n) - 1; i >= 0; i--) {
+            const uvec2 s = scratch[sbase + i];
+            if ((s.x & ACTIVE_GLOBAL) == 0u) continue;
+            out_index--;
+            const uint parent_out = s.y != NO_PARENT ? scratch[sbase + s.y].y : NO_PARENT;
+            scratch[sbase + i].y = out_index;
+            const uint o = 3u * (base + out_index);
+            out_pool[o] = in_pool[3u * (off + uint(i))];
+            out_pool[o + 1u] = parent_out;
+            out_pool[o + 2u] = (s.x & NEGATIVE) != 0u ? 0xffu : 1u;
+        }
+    }
+}

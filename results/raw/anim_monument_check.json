@@ -1,0 +1,9 @@
+{"scene": "scenes/monument.json", "method": "incremental", "frames": 4, "depth": 8, "radius": 0.2, "k": 0.1, "threads": 32,
+ "setup_seconds": 1.089893, "setup_prim_evals": 54236862, "static_cells": 1816656,
+ "frames_data": [
+  {"frame": 0, "center": [-0.92327, 0.14801, 0.00000], "time_octree": 0.198820, "time_dc": 0.496406, "time_total": 0.729278, "cells": 1027939, "static_leaves": 994353, "dynamic_cells": 46040, "reused_corners": 1505768, "reused_crossings": 575877, "reused_vertices": 570110, "corners": 1556465, "crossings": 594674, "prim_evals": 2534922, "triangles": 1189348, "identical": true},
+  {"frame": 1, "center": [-0.00000, 0.10291, -1.17914], "time_octree": 0.113779, "time_dc": 0.490918, "time_total": 0.628119, "cells": 1031359, "static_leaves": 1001006, "dynamic_cells": 41493, "reused_corners": 1516698, "reused_crossings": 580526, "reused_vertices": 574738, "corners": 1562998, "crossings": 598006, "prim_evals": 1962890, "triangles": 1196012, "identical": true},
+  {"frame": 2, "center": [0.57995, 0.35427, -0.00000], "time_octree": 0.121893, "time_dc": 0.434579, "time_total": 0.575930, "cells": 1031514, "static_leaves": 1000529, "dynamic_cells": 43660, "reused_corners": 1514755, "reused_crossings": 577406, "reused_vertices": 571460, "corners": 1562093, "crossings": 596760, "prim_evals": 3498500, "triangles": 1193520, "identical": true},
+  {"frame": 3, "center": [-0.00000, 0.49937, -0.43979], "time_octree": 0.120167, "time_dc": 0.398210, "time_total": 0.537265, "cells": 1027858, "static_leaves": 993098, "dynamic_cells": 47396, "reused_corners": 1505331, "reused_crossings": 572298, "reused_vertices": 566206, "corners": 1555786, "crossings": 593734, "prim_evals": 3667422, "triangles": 1187468, "identical": true}
+ ],
+ "mean_frame_seconds": 0.617648, "max_frame_seconds": 0.729278, "peak_rss_mb": 1523.5, "all_identical": true}

@@ -1,0 +1,329 @@
+// Coarse leaves of one octree level on the GPU, as AdaptiveMesher::probe in include/lpm/adaptive.h.
+// A cell whose pruned tree is a single primitive is sampled on the grid of the finest level inside
+// it (P + 1 points per axis), and it becomes a coarse leaf when the samples keep the topology of one
+// vertex (one sign change at most along each edge of the cell, no sheet inside a face whose corners
+// share a sign, one component and no ambiguous face in the cell and in every subcell) and the
+// quadric of the crossings of the sample edges fits one vertex within the tolerance. Four passes
+// (pc.mode):
+//   0  one workgroup per cell: the samples and the topology; a cell that passes lists its crossing
+//      sample edges, in increasing order, in a block of the edge list
+//   1  one invocation: the sizes of the next two dispatches
+//   2  one invocation per listed edge: its crossing point and normal
+//   3  one invocation per listed cell: its quadric, summed in the order of the CPU, its vertex and
+//      residual; a coarse leaf is recorded with its vertex and the signs of its corners, marked in
+//      the bitset of its level, and flagged in the cell list, so that prune.comp does not
+//      subdivide it
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const int STACK = 16;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer F64 { double v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Counters {
+    uint64_t prim_evals, op_evals;
+    uint found[16];  // coarse leaves per level
+};
+layout(buffer_reference, std430, buffer_reference_align = 32) readonly buffer Params {
+    dvec4 aabb_min;
+    dvec4 size;       // size of a cell of the level
+    double fd_h;      // finite difference step of the normals, that of the finest level
+    double tol;       // largest residual of the quadric (absolute)
+    uint P;           // cells of the finest level per axis inside a cell: 2^(depth - level), up to 32
+    uint level;
+    uint n_cells;
+    uint max_iters;
+    U32 cells;        // the cells of the level as GpuCell: x, y, z, flag, tree offset, tree size, -, -
+    U32 tree_pool;
+    U32 nodes;
+    F64 prims;
+    F64 ops;
+    U32 bits;         // bitset of the coarse leaves of the level
+    U32 records;      // 12 uints per coarse leaf: x, y, z, level | corner signs << 8, then its vertex
+                      // (3 doubles) from uint 4 on
+    Counters counters;
+    U32 passed;       // 4 per cell that passed the topology: cell, first edge, edges, corner signs
+    U32 edges;        // 2 per listed edge: index in passed, sample edge (axis * (P + 1)^3 + sample)
+    F64 cross;        // 6 per listed edge: crossing point, unit normal
+    U32 level_counts; // listed edges (may exceed edge_cap), cells in passed, then the dispatch sizes of passes 2 and 3
+    uint edge_cap;
+};
+
+layout(push_constant) uniform PC {
+    Params p;
+    uint count;
+    uint mode;
+} pc;
+
+#define PP (pc.p)
+#define PRIM_VALUE(i) PP.prims.v[i]
+#include "sdf.glsl"
+
+const uint NODE_PRIM = 1u;
+const uint COARSE_LEAF = 2u;  // flag of a cell in the cell list (see prune_common.glsl)
+const int edge_corners[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+
+uint prim_evals = 0u, op_evals = 0u;
+
+double eval_tree(uvec3 tree, dvec3 p) {
+    double st[STACK];
+    int sp = 0;
+    for (uint i = 0u; i < tree.y; i++) {
+        const uint e = 3u * (tree.x + i);
+        const uint node = PP.tree_pool.v[e];
+        const uint type = PP.nodes.v[2u * node], idx = PP.nodes.v[2u * node + 1u];
+        double d;
+        if (type == NODE_PRIM) {
+            d = eval_primitive(idx, p);
+            prim_evals++;
+        } else {
+            sp--; const double b = st[sp];
+            sp--; const double a = st[sp];
+            d = eval_op(dvec4(PP.ops.v[4u * idx], PP.ops.v[4u * idx + 1u], PP.ops.v[4u * idx + 2u], 0.0), a, b);
+            op_evals++;
+        }
+        st[sp] = (PP.tree_pool.v[e + 2u] & 0xffu) == 0xffu ? -d : d;
+        sp++;
+    }
+    return st[0];
+}
+
+#include "dc_common.glsl"
+
+shared uint sign_bits[1124];  // one bit per sample, (32 + 1)^3 at most: 1 when f < 0
+shared uint failed;
+shared uint sub_total[64];
+shared uint block_base, block_index;
+
+uint P1;
+uint sample_index(uvec3 g) { return (g.x * P1 + g.y) * P1 + g.z; }
+uvec3 sample_of(uint s) { return uvec3(s / (P1 * P1), (s / P1) % P1, s % P1); }
+bool inside(uvec3 g) { const uint s = sample_index(g); return (sign_bits[s >> 5] & (1u << (s & 31u))) != 0u; }
+uvec3 corner_bits(int c) { return uvec3(c & 1, (c >> 1) & 1, (c >> 2) & 1); }
+// The point of sample g of a cell with corner lo, as the point() of the probe on the CPU.
+dvec3 sample_point(dvec3 lo, uvec3 g) { return lo + (PP.size.xyz * dvec3(g)) / double(PP.P); }
+dvec3 cell_lo(uint i) {
+    return PP.aabb_min.xyz + dvec3(PP.cells.v[8u * i], PP.cells.v[8u * i + 1u], PP.cells.v[8u * i + 2u]) * PP.size.xyz;
+}
+// Sample edge e (axis * (P + 1)^3 + sample): its first sample, along +axis.
+bool crossing_edge(uint e) {
+    const uint n = P1 * P1 * P1, axis = e / n;
+    const uvec3 g = sample_of(e % n);
+    if (g[axis] == PP.P) return false;
+    uvec3 g1 = g;
+    g1[axis] += 1u;
+    return inside(g) != inside(g1);
+}
+
+// Components of the crossing edges of a cell from the signs of its corners (bit k: corner k is
+// inside), as AdaptiveMesher::components: -1 when a face has four crossing edges. The table was
+// generated from that function, the 256 sign patterns once.
+const int NCOMP[256] = int[256](
+     0,  1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,  1,  1,  1,  1,
+     1,  1, -1,  1, -1,  1, -1,  1,  2, -1, -1,  1, -1,  1, -1,  1,
+     1, -1,  1,  1,  2, -1, -1,  1, -1, -1,  1,  1, -1, -1,  1,  1,
+     1,  1,  1,  1, -1,  1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1,
+     1, -1,  2, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1,  1,  1,
+     1,  1, -1,  1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     1,  1,  1,  1,  1,  1, -1,  1, -1, -1, -1, -1, -1, -1,  2,  1,
+     1,  2, -1, -1, -1, -1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+     1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1, -1,  1,  1,
+     1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1,  2, -1,  1,
+     1, -1, -1, -1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1,  1,  1,
+     1,  1, -1, -1,  1,  1, -1, -1,  1, -1, -1,  2,  1,  1, -1,  1,
+     1, -1,  1, -1,  1, -1, -1,  2,  1, -1,  1, -1,  1, -1,  1,  1,
+     1,  1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,  1,  1,  1,  0);
+int components(uint neg) { return NCOMP[neg]; }
+
+void flush_counters() {
+    const uint sp = subgroupAdd(prim_evals), so = subgroupAdd(op_evals);
+    if (subgroupElect() && (sp | so) != 0u) {
+        atomicAdd(PP.counters.prim_evals, uint64_t(sp));
+        atomicAdd(PP.counters.op_evals, uint64_t(so));
+    }
+}
+
+#define WG 64u
+
+// Pass 0: one workgroup per cell.
+void topology() {
+    const uint i = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    // Both tests are uniform in the workgroup.
+    if (i >= PP.n_cells || PP.cells.v[8u * i + 5u] != 1u) return;
+    const uvec3 tree = uvec3(PP.cells.v[8u * i + 4u], 1u, 0u);
+    const uint P = PP.P;
+    P1 = P + 1u;
+    const uint n = P1 * P1 * P1, words = (n + 31u) / 32u;
+    const dvec3 lo = cell_lo(i);
+
+    // Signs of the samples.
+    for (uint w = lane; w < words; w += WG) sign_bits[w] = 0u;
+    if (lane == 0u) failed = 0u;
+    barrier();
+    for (uint s = lane; s < n; s += WG)
+        if (eval_tree(tree, sample_point(lo, sample_of(s))) < 0.0) atomicOr(sign_bits[s >> 5], 1u << (s & 31u));
+    barrier();
+
+    bool fail = false;
+    // Edges of the cell: one sign change at most along the samples.
+    if (lane < 12u) {
+        const uvec3 g0 = corner_bits(edge_corners[lane][0]) * P;
+        const uint axis = lane / 4u;
+        int changes = 0;
+        bool prev = inside(g0);
+        for (uint t = 1u; t <= P; t++) {
+            uvec3 g = g0;
+            g[axis] = t;
+            const bool b = inside(g);
+            changes += b != prev ? 1 : 0;
+            prev = b;
+        }
+        fail = changes > 1;
+    }
+    // Faces whose corners share a sign: every sample of the face shares it.
+    for (uint t = lane; t < 6u * P1 * P1 && !fail; t += WG) {
+        const uint face = t / (P1 * P1), axis = face / 2u, side = face % 2u, B = (axis + 1u) % 3u, C = (axis + 2u) % 3u;
+        uvec3 g;
+        g[axis] = side * P;
+        g[B] = 0u; g[C] = 0u;
+        const bool sign = inside(g);
+        bool uniform_corners = true;
+        for (uint u = 0u; u <= P; u += P) for (uint v = 0u; v <= P; v += P) { g[B] = u; g[C] = v; uniform_corners = uniform_corners && inside(g) == sign; }
+        if (!uniform_corners) continue;
+        g[B] = (t % (P1 * P1)) / P1;
+        g[C] = t % P1;
+        fail = inside(g) != sign;
+    }
+    // Every subcell: one component at most, no ambiguous face.
+    for (uint t = lane; t < P * P * P && !fail; t += WG) {
+        const uvec3 g = uvec3(t / (P * P), (t / P) % P, t % P);
+        uint neg = 0u;
+        for (int k = 0; k < 8; k++) if (inside(g + corner_bits(k))) neg |= 1u << k;
+        const int c = components(neg);
+        fail = c < 0 || c > 1;
+    }
+    if (fail) failed = 1u;
+    barrier();
+    // The cell: one component.
+    uint neg8 = 0u;
+    for (int k = 0; k < 8; k++) if (inside(corner_bits(k) * P)) neg8 |= 1u << k;
+    if (failed != 0u || components(neg8) != 1) { flush_counters(); return; }
+
+    // The crossing sample edges, in increasing order: each invocation takes a contiguous range.
+    const uint ne = 3u * n, chunk = (ne + WG - 1u) / WG, e0 = min(lane * chunk, ne), e1 = min(e0 + chunk, ne);
+    uint mine = 0u;
+    for (uint e = e0; e < e1; e++) if (crossing_edge(e)) mine++;
+    const uint before_sub = subgroupExclusiveAdd(mine), sub_sum = subgroupAdd(mine);
+    if (subgroupElect()) sub_total[gl_SubgroupID] = sub_sum;
+    barrier();
+    uint before = before_sub, total = 0u;
+    for (uint sg = 0u; sg < gl_NumSubgroups; sg++) {
+        if (sg < gl_SubgroupID) before += sub_total[sg];
+        total += sub_total[sg];
+    }
+    if (lane == 0u) {
+        block_base = atomicAdd(PP.level_counts.v[0], total);
+        block_index = atomicAdd(PP.level_counts.v[1], 1u);
+        const uint j = block_index;
+        PP.passed.v[4u * j] = i;
+        PP.passed.v[4u * j + 1u] = block_base;
+        PP.passed.v[4u * j + 2u] = block_base + total <= PP.edge_cap ? total : 0u;  // the host retries with more room
+        PP.passed.v[4u * j + 3u] = neg8;
+    }
+    barrier();
+    if (block_base + total <= PP.edge_cap) {
+        uint o = block_base + before;
+        for (uint e = e0; e < e1; e++) {
+            if (!crossing_edge(e)) continue;
+            PP.edges.v[2u * o] = block_index;
+            PP.edges.v[2u * o + 1u] = e;
+            o++;
+        }
+    }
+    flush_counters();
+}
+
+// Pass 2: one invocation per listed edge.
+void crossing() {
+    const uint u = gl_GlobalInvocationID.x;
+    if (u < min(PP.level_counts.v[0], PP.edge_cap)) {
+        const uint i = PP.passed.v[4u * PP.edges.v[2u * u]], e = PP.edges.v[2u * u + 1u];
+        const uvec3 tree = uvec3(PP.cells.v[8u * i + 4u], 1u, 0u);
+        P1 = PP.P + 1u;
+        const uint n = P1 * P1 * P1, axis = e / n;
+        const uvec3 g = sample_of(e % n);
+        uvec3 g1 = g;
+        g1[axis] += 1u;
+        const dvec3 lo = cell_lo(i), p0 = sample_point(lo, g), p1 = sample_point(lo, g1);
+        const double f0 = eval_tree(tree, p0), f1 = eval_tree(tree, p1);
+        bool converged;
+        const double r = edge_root(tree, p0, p1, f0, f1, PP.max_iters, converged);
+        const dvec3 x = p0 + r * (p1 - p0);
+        const dvec3 nr = crossing_normal(tree, x, PP.fd_h, converged, axis, f0);
+        for (int k = 0; k < 3; k++) {
+            PP.cross.v[6u * u + uint(k)] = x[k];
+            PP.cross.v[6u * u + 3u + uint(k)] = nr[k];
+        }
+    }
+    flush_counters();
+}
+
+// Pass 3: one invocation per listed cell.
+void solve() {
+    const uint j = gl_GlobalInvocationID.x;
+    if (j >= PP.level_counts.v[1]) return;
+    const uint i = PP.passed.v[4u * j], first = PP.passed.v[4u * j + 1u], count = PP.passed.v[4u * j + 2u];
+    if (count < 3u) return;
+    double q[13];  // ATA (xx, xy, xz, yy, yz, zz), ATb, b^2, sum of the points
+    for (int k = 0; k < 13; k++) q[k] = 0.0;
+    for (uint u = first; u < first + count; u++) {
+        const dvec3 x = dvec3(PP.cross.v[6u * u], PP.cross.v[6u * u + 1u], PP.cross.v[6u * u + 2u]);
+        const dvec3 nr = dvec3(PP.cross.v[6u * u + 3u], PP.cross.v[6u * u + 4u], PP.cross.v[6u * u + 5u]);
+        const double b = nr.x * x.x + nr.y * x.y + nr.z * x.z;
+        q[0] += nr.x * nr.x; q[1] += nr.x * nr.y; q[2] += nr.x * nr.z;
+        q[3] += nr.y * nr.y; q[4] += nr.y * nr.z; q[5] += nr.z * nr.z;
+        q[6] += nr.x * b; q[7] += nr.y * b; q[8] += nr.z * b;
+        q[9] += b * b;
+        q[10] += x.x; q[11] += x.y; q[12] += x.z;
+    }
+    const dvec3 lo = cell_lo(i), hi = lo + PP.size.xyz;
+    double ata[3][3] = {{q[0], q[1], q[2]}, {q[1], q[3], q[4]}, {q[2], q[4], q[5]}};
+    const dvec3 atb = dvec3(q[6], q[7], q[8]);
+    const dvec3 v = qef_solve(ata, atb, dvec3(q[10], q[11], q[12]) / double(count), lo, hi);
+    dvec3 av;
+    for (int r = 0; r < 3; r++) av[r] = ata[r][0] * v.x + ata[r][1] * v.y + ata[r][2] * v.z;
+    const double r2 = (dot(v, av) - 2.0 * dot(v, atb) + q[9]) / double(count);
+    if (sqrt(max(r2, 0.0)) > PP.tol) return;
+
+    const uvec3 xyz = uvec3(PP.cells.v[8u * i], PP.cells.v[8u * i + 1u], PP.cells.v[8u * i + 2u]);
+    const uint k = atomicAdd(PP.counters.found[PP.level], 1u);
+    PP.records.v[12u * k] = xyz.x;
+    PP.records.v[12u * k + 1u] = xyz.y;
+    PP.records.v[12u * k + 2u] = xyz.z;
+    PP.records.v[12u * k + 3u] = PP.level | (PP.passed.v[4u * j + 3u] << 8);
+    F64 rv = F64(uint64_t(PP.records) + 48ul * uint64_t(k) + 16ul);
+    rv.v[0] = v.x; rv.v[1] = v.y; rv.v[2] = v.z;
+    const uint side = 1u << PP.level, l = (xyz.x * side + xyz.y) * side + xyz.z;
+    atomicOr(PP.bits.v[l >> 5], 1u << (l & 31u));
+    PP.cells.v[8u * i + 3u] = COARSE_LEAF;
+}
+
+void main() {
+    if (pc.mode == 0u) topology();
+    else if (pc.mode == 1u) {
+        // Dispatch sizes of passes 2 and 3 (indirect).
+        if (gl_GlobalInvocationID.x != 0u) return;
+        const uint edges = min(PP.level_counts.v[0], PP.edge_cap), cells = PP.level_counts.v[1];
+        PP.level_counts.v[2] = (edges + WG - 1u) / WG; PP.level_counts.v[3] = 1u; PP.level_counts.v[4] = 1u;
+        PP.level_counts.v[5] = (cells + WG - 1u) / WG; PP.level_counts.v[6] = 1u; PP.level_counts.v[7] = 1u;
+    } else if (pc.mode == 2u) crossing();
+    else solve();
+}

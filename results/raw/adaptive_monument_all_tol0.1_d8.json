@@ -1,0 +1,13 @@
+{
+  "scene": "scenes/monument.json", "method": "lipschitz", "depth": 8, "threads": 32, "inherit": true, "analytic": false, "dense": false,
+  "nodes": 6323, "prims": 3162, "ops": 3161, "tree_height": 211,
+  "time_load": 0.112118, "time_octree": 0.266994, "time_mesh": 2.313299, "time_dense": 0.000000, "time_total": 3.013054,
+  "time_dc_index": 0.000000, "time_dc_corners": 0.000000, "time_dc_edges": 0.000000, "time_dc_qef": 0.000000, "time_dc_faces": 0.000000,
+  "octree_prim_evals": 0, "octree_op_evals": 0, "octree_prim_ivals": 0, "octree_op_ivals": 0,
+  "mesh_prim_evals": 54283629, "mesh_op_evals": 43979870,
+  "prim_evals": 54283629, "node_evals": 98263499,
+  "cells": 709286, "corners": 0, "crossings": 0, "vertices": 432066, "triangles": 865840, "analytic_hits": 0,
+  "pool_entries": 0, "pool_bytes": 0, "peak_rss_mb": 2611.1,
+  "adaptive": {"tol": 0.1, "single_primitive_only": false, "min_depth": 3, "fine_leaves": 1020515, "leaves": 709286, "collapsed": 46656, "time_hermite": 1.467758, "time_collapse": 0.603651, "time_faces": 0.241890, "leaves_per_level": [0, 0, 0, 0, 0, 0, 0, 46656, 662630]},
+  "levels": []
+}

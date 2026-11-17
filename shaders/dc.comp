@@ -1,0 +1,1113 @@
+// Dual contouring of the finest octree level on the GPU, the same algorithm as
+// dual_contour_leaves in include/lpm/dc.h. The hash maps of the CPU code become dense grids:
+// cell_grid (one entry per cell of the N^3 grid), corner_val ((N + 1)^3 corners) and bitsets of
+// the leaves and of the crossing edges, whose prefix sums give the rank of a leaf or an edge.
+// Compacting the bitsets lists the leaves and the edges in increasing key order, the order the
+// CPU code obtains by sorting, so the output does not depend on the scheduling of the GPU.
+// A dynamic frame (frame = 1) touches a small region of the grid: its bitsets carry a second
+// level, one bit per word, and atomic counts, so that compacting visits only the words in use,
+// and the next frame clears only what this one set (STAGE_CLEAR).
+// Every stage is one dispatch; this file is compiled once per stage with -DSTAGE=n.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#define STAGE_SCATTER 1   // leaves into the cell grid and the leaf bitset
+#define STAGE_COMPACT 2   // bitset to the sorted list of its set positions
+#define STAGE_CORNERS 3   // value of every corner of a leaf
+#define STAGE_EDGES 4     // bitset of the sign-changing edges of the leaves
+#define STAGE_CROSS 5     // crossing point and normal of every such edge
+#define STAGE_COMP 6      // connected components of the crossing edges of every leaf
+#define STAGE_QEF 7       // one vertex per component
+#define STAGE_FACES 8     // two triangles per crossing edge
+// Patch of a dynamic frame (dynamic.h), with frame = 1:
+#define STAGE_TOUCH 9     // static leaves under the culled cells, one workgroup per culled cell
+#define STAGE_DYNBITS 10  // the dynamic leaves into the bitsets
+#define STAGE_RING 11     // static leaves sharing a corner with a dynamic leaf
+#define STAGE_REGION 12   // the region cells (dynamic leaves, ring, and with coarse leaves the finest leaves of
+                          // each dissolved coarse leaf and one cell around it) in increasing cell order
+#define STAGE_KEEP 13     // static faces that no dynamic or swallowed cell (nor a dissolved coarse leaf) touches;
+                          // marching cubes: the static leaves whose triangles stay
+#define STAGE_NEWFLAGS 14 // faces of the region that stay
+#define STAGE_ASSEMBLE 15 // kept static faces (triangles with marching cubes), then the new ones
+#define STAGE_CLEAR 16    // what the previous frame set in the grids and bitsets
+#define STAGE_LIST 17     // the words in use of a bitset, from its second level, in increasing order
+// Coarse leaves of probe.comp, with coarse_on:
+#define STAGE_COARSE_VERT 18   // the vertex of every coarse leaf
+#define STAGE_COARSE_FACES 19  // the faces of the edges of the coarse leaves that no smaller leaf touches
+// Marching cubes on the leaves, with mc = 1, instead of QEF and FACES (COMP writes the pairings and counts):
+#define STAGE_MC_FACES 20      // the triangles of every leaf, around the cycles of its crossing edges
+// Frames of a dynamic scene with coarse leaves:
+#define STAGE_DISSOLVE 21      // the finest leaves of every coarse leaf that the frame dissolves, into the region
+
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const int STACK = 16;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer F64 { double v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Counters {
+    uint64_t prim_evals, op_evals;
+    uint ambiguous, empty_triangles;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 32) readonly buffer Params {
+    dvec4 aabb_min;
+    dvec4 size;       // size of a leaf cell
+    double fd_h;      // finite difference step of the normals
+    uint N;           // cells per axis
+    uint n_cells;     // leaves of the octree
+    uint max_iters;   // root finding iterations
+    uint full_n;      // > 0: evaluate the full tree, entries [0, full_n) of tree_pool, everywhere
+    U32 nodes;        // 2 per node: type, index of its primitive or operator
+    F64 prims;        // 24 per primitive
+    F64 ops;          // 4 per operator: k, s, 0.25 / k
+    U32 leaf_cells;   // 8 per leaf of the octree: x, y, z, -, tree offset, tree size, -, -
+    U32 tree_pool;    // 3 per tree entry, as TreeEntry
+    U32 cell_grid;    // N^3: index of the leaf in leaf_cells + 1, or 0 (not used by a frame, see cell_at)
+    U32 cell_bits;    // N^3 bits: the cell is a leaf
+    U32 cell_prefix;  // per word of cell_bits: leaves before it
+    U32 leaves;       // leaves in increasing cell order (index in leaf_cells)
+    F64 corner_val;   // (N + 1)^3
+    U32 edge_bits;    // 3 (N + 1)^3 bits, edge key = corner key * 3 + axis
+    U32 edge_prefix;  // per word of edge_bits: crossing edges before it
+    U32 edges;        // crossing edge keys in increasing order
+    F64 crossings;    // 6 per crossing edge: point, unit normal
+    U32 comp;         // 2 per sorted leaf: component of each of its 12 edges, 4 bits each (15: none)
+    U32 ncomp;        // components per sorted leaf
+    U32 vbase;        // first vertex of each sorted leaf
+    F64 V;            // 3 per vertex
+    U32 F;            // 6 per crossing edge: two triangles, one (F[6u + 3] = 0xffffffff, next to a
+                      // coarse leaf) or none (F[6u] = 0xffffffff)
+    U32 vtree;        // tree size of the cell of each vertex
+    Counters counters;
+    // Patch of a dynamic frame. The leaves are the region cells; leaf_cells[8 i + 3] = 1 marks a
+    // static ring cell, whose tree is in static_pool and whose corners, crossings and vertices are
+    // those of the static mesh. The static_* arrays are the dual contouring of the static scene.
+    uint frame;
+    uint nv_static;       // vertices of the static mesh; the new vertices follow them
+    uint depth;
+    uint n_static_edges;  // static face slots: Es finest crossing edges, then 12 per coarse leaf; static leaves (mc)
+    U32 static_pool;
+    F64 static_corner_val;
+    U32 static_edge_bits;
+    U32 static_edge_prefix;
+    F64 static_crossings;
+    U32 static_cell_bits;
+    U32 static_cell_prefix;
+    U32 static_vbase;
+    U32 static_leaf_cells;
+    U32 static_edges;
+    U32 static_F;
+    U32 dyn_cells;        // dynamic leaves, 8 uints each
+    U32 dyn_bits;         // N^3 bits
+    U32 touched_bits;     // N^3 bits: static leaves swallowed by the sphere
+    U32 culled;           // culled cells with static surface below: x, y, z, level
+    U32 ncomp_dyn;        // components of each region cell that is dynamic, 0 for the ring
+    U32 vbase_dyn;        // first new vertex of each region cell
+    U32 keep_static;      // per static face slot, 1 when its face stays; mc: per static leaf, its kept triangles
+    U32 keep_prefix;
+    U32 new_flags;        // per region crossing edge: 1 when it gives a new quad
+    U32 new_prefix;
+    U32 out_F;            // kept static faces, then new ones: 6 indices per slot (the second triangle NONE
+                          // where a face next to a coarse leaf is one), or 3 per triangle with mc
+    U32 patch_args;       // shaders/dyn_args.comp, mode 1: v[6] dynamic leaves, v[7] swallowed cells
+    // Frame: second level of the bitsets and the words in use. frame_counts: region cells and
+    // their words, crossing edges and their words.
+    U32 frame_counts;
+    U32 cell_hi;          // one bit per word of cell_bits
+    U32 cell_hi_prefix;
+    U32 cell_word_list;   // words of cell_bits in use, in increasing order
+    U32 cell_word_count;  // their set bits
+    U32 cell_word_prefix;
+    U32 edge_hi;
+    U32 edge_hi_prefix;
+    U32 edge_word_list;
+    U32 edge_word_count;
+    U32 edge_word_prefix;
+    // Coarse leaves (probe.comp): their bitsets, one per level, concatenated (level l from word
+    // coarse_word_off[l]), and the prefix sums of the words, whose ranks number the coarse leaves
+    // by level and then by cell. The coarse leaf of rank r has the vertex nv_fine + r.
+    U32 coarse_bits;
+    U32 coarse_prefix;
+    U32 coarse_records;   // 12 uints per coarse leaf, as probe.comp writes them, all levels
+    U32 coarse_F;         // 6 per edge of each coarse leaf (by rank): as F
+    uint coarse_on;
+    uint coarse_min;      // first level with coarse leaves
+    uint nv_fine;         // vertices of the finest leaves
+    uint n_coarse;
+    uint coarse_word_off[12];
+    U32 corner_list;      // frame: the corners to evaluate (STAGE_CORNERS mode 1), counted in frame_counts.v[4]
+    U32 static_leaves;    // frame: the static leaves in increasing cell order (leaves of the static run)
+    // Marching cubes on the leaves (not with coarse leaves): the vertices are the crossing points (V
+    // and vtree by crossing edge), COMP writes the triangles of each leaf to ncomp (and ncomp_dyn) and
+    // the pairings of its ambiguous faces to comp, and MC_FACES writes the triangles from vbase on. A
+    // frame keeps the static triangles leaf by leaf (KEEP, ASSEMBLE) and writes those of its new cells
+    // after them in out_F, from keep_prefix[n_static_edges] + vbase_dyn.
+    uint mc;
+    uint project;  // 1: the vertices of QEF onto the surface (DCParams::project_vertices; 0 with the coarse leaves of mesh())
+    // Frame of a dynamic scene with coarse leaves (coarse_on): per coarse leaf, by rank, 1 when a
+    // dynamic or swallowed cell lies in it; the frame meshes it by its finest leaves.
+    U32 dissolved;
+};
+
+layout(push_constant) uniform PC {
+    Params p;
+    uint count;  // invocations that do work
+    uint mode;   // STAGE_COMPACT: 0 leaves, 1 edges
+} pc;
+
+#define P (pc.p)
+#define PRIM_VALUE(i) P.prims.v[i]
+#include "sdf.glsl"
+
+const uint NODE_PRIM = 1u;
+const uint NONE = 0xffffffffu;
+const int edge_corners[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+
+uint prim_evals = 0u, op_evals = 0u;
+
+// The tree of a leaf (offset, size, 1 when it is in static_pool), or the full tree.
+uvec3 leaf_tree(uint id) {
+    if (P.full_n > 0u) return uvec3(0u, P.full_n, 0u);
+    return uvec3(P.leaf_cells.v[8u * id + 4u], P.leaf_cells.v[8u * id + 5u], P.leaf_cells.v[8u * id + 3u]);
+}
+bool is_static(uint id) { return P.frame != 0u && P.leaf_cells.v[8u * id + 3u] != 0u; }
+
+uint pool_value(uvec3 tree, uint i) { return tree.z != 0u ? P.static_pool.v[i] : P.tree_pool.v[i]; }
+
+double eval_tree(uvec3 tree, dvec3 p) {
+    double st[STACK];
+    int sp = 0;
+    for (uint i = 0u; i < tree.y; i++) {
+        const uint e = 3u * (tree.x + i);
+        const uint node = pool_value(tree, e);
+        const uint type = P.nodes.v[2u * node], idx = P.nodes.v[2u * node + 1u];
+        double d;
+        if (type == NODE_PRIM) {
+            d = eval_primitive(idx, p);
+            prim_evals++;
+        } else {
+            sp--; const double b = st[sp];
+            sp--; const double a = st[sp];
+            const dvec4 op = dvec4(P.ops.v[4u * idx], P.ops.v[4u * idx + 1u], P.ops.v[4u * idx + 2u], 0.0);
+            d = eval_op(op, a, b);
+            op_evals++;
+        }
+        st[sp] = (pool_value(tree, e + 2u) & 0xffu) == 0xffu ? -d : d;
+        sp++;
+    }
+    return st[0];
+}
+
+#include "dc_common.glsl"
+
+// Adds the evaluations of the invocation to the counters, one atomic per subgroup; every
+// invocation calls it once, in uniform control flow.
+void flush_counters() {
+    const uint sp = subgroupAdd(prim_evals), so = subgroupAdd(op_evals);
+    if (subgroupElect() && (sp | so) != 0u) {
+        atomicAdd(P.counters.prim_evals, uint64_t(sp));
+        atomicAdd(P.counters.op_evals, uint64_t(so));
+    }
+}
+
+uint lin(uvec3 c) { return (c.x * P.N + c.y) * P.N + c.z; }
+// Rank of the leaf at linear position l among the sorted leaves (the bit must be set).
+uint leaf_rank(uint l) {
+    return P.cell_prefix.v[l >> 5] + bitCount(P.cell_bits.v[l >> 5] & ((1u << (l & 31u)) - 1u));
+}
+uint edge_rank(uint k) {
+    return P.edge_prefix.v[k >> 5] + bitCount(P.edge_bits.v[k >> 5] & ((1u << (k & 31u)) - 1u));
+}
+uint static_edge_rank(uint k) {
+    return P.static_edge_prefix.v[k >> 5] + bitCount(P.static_edge_bits.v[k >> 5] & ((1u << (k & 31u)) - 1u));
+}
+uint static_leaf_rank(uint l) {
+    return P.static_cell_prefix.v[l >> 5] + bitCount(P.static_cell_bits.v[l >> 5] & ((1u << (l & 31u)) - 1u));
+}
+#define BIT(bits, l) (((bits).v[(l) >> 5] & (1u << ((l) & 31u))) != 0u)
+// Whether the cell at integer coordinates is a leaf, from the bitset: 32 times less memory than
+// cell_grid (512 MB at depth 9, where its scattered reads miss the caches).
+bool is_leaf(ivec3 c) {
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(int(P.N))))) return false;
+    return BIT(P.cell_bits, lin(uvec3(c)));
+}
+// Index in leaf_cells of the leaf at integer cell coordinates, or -1. A frame lists its region
+// cells in increasing cell order, so the index is the rank in the region bitset and the dense
+// cell_grid (512 MB at depth 9) is not needed.
+int cell_at(ivec3 c) {
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(int(P.N))))) return -1;
+    const uint l = lin(uvec3(c));
+    if (P.frame != 0u) return BIT(P.cell_bits, l) ? int(leaf_rank(l)) : -1;
+    return int(P.cell_grid.v[l]) - 1;
+}
+
+// Frame: sets the region bit of cell l, counting the new cells and the new words in frame_counts
+// (0 and 1) and marking the word in the second level.
+void set_region_bit(uint l) {
+    const uint bit = 1u << (l & 31u);
+    const uint old = atomicOr(P.cell_bits.v[l >> 5], bit);
+    if ((old & bit) != 0u) return;
+    atomicAdd(P.frame_counts.v[0], 1u);
+    if (old == 0u) {
+        atomicAdd(P.frame_counts.v[1], 1u);
+        atomicOr(P.cell_hi.v[l >> 10], 1u << ((l >> 5) & 31u));
+    }
+}
+// The same for the cells of mask m in word w of the region bitset.
+void set_region_bits(uint w, uint m) {
+    const uint old = atomicOr(P.cell_bits.v[w], m), fresh = m & ~old;
+    if (fresh == 0u) return;
+    atomicAdd(P.frame_counts.v[0], bitCount(fresh));
+    if (old == 0u) {
+        atomicAdd(P.frame_counts.v[1], 1u);
+        atomicOr(P.cell_hi.v[w >> 5], 1u << (w & 31u));
+    }
+}
+uint corner_key(uvec3 c) { const uint n1 = P.N + 1u; return (c.x * n1 + c.y) * n1 + c.z; }
+uvec3 corner_of_key(uint key) { const uint n1 = P.N + 1u; return uvec3(key / (n1 * n1), (key / n1) % n1, key % n1); }
+dvec3 corner_point(uvec3 c) { return P.aabb_min.xyz + dvec3(c) * P.size.xyz; }
+uvec3 leaf_xyz(uint id) { return uvec3(P.leaf_cells.v[8u * id], P.leaf_cells.v[8u * id + 1u], P.leaf_cells.v[8u * id + 2u]); }
+uint tree_size(uint id) { return P.leaf_cells.v[8u * id + 5u]; }
+
+// The four cells around the edge from corner c along axis, counterclockwise around the +axis
+// direction (edge_cells).
+void cells_around(ivec3 c, uint axis, out ivec3 cs[4]) {
+    const ivec2 off[4] = {ivec2(-1, -1), ivec2(0, -1), ivec2(0, 0), ivec2(-1, 0)};
+    for (int q = 0; q < 4; q++) {
+        ivec3 x = c;
+        if (axis == 0u) { x.y += off[q].x; x.z += off[q].y; }
+        else if (axis == 1u) { x.z += off[q].x; x.x += off[q].y; }
+        else { x.x += off[q].x; x.y += off[q].y; }
+        cs[q] = x;
+    }
+}
+void edge_cells(uint ekey, out int ids[4]) {
+    ivec3 cs[4];
+    cells_around(ivec3(corner_of_key(ekey / 3u)), ekey % 3u, cs);
+    for (int q = 0; q < 4; q++) ids[q] = cell_at(cs[q]);
+}
+
+// Rank of the coarse leaf at cell c of level l, or -1 when that cell is not a coarse leaf.
+int coarse_rank(uint l, uvec3 c) {
+    const uint side = 1u << l, lin = (c.x * side + c.y) * side + c.z;
+    const uint w = P.coarse_word_off[l] + (lin >> 5), bit = 1u << (lin & 31u), word = P.coarse_bits.v[w];
+    if ((word & bit) == 0u) return -1;
+    return int(P.coarse_prefix.v[w] + bitCount(word & (bit - 1u)));
+}
+// The coarse leaf that contains cell c of level l (the cell itself or an ancestor): its rank, and
+// its level in lvl; -1 when there is none.
+int coarse_cover(uint l, ivec3 c, out uint lvl) {
+    lvl = 0u;
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(int(1u << l))))) return -1;
+    for (int k = min(int(l), int(P.depth) - 1); k >= int(P.coarse_min); k--) {
+        const int r = coarse_rank(uint(k), uvec3(c) >> (l - uint(k)));
+        if (r >= 0) { lvl = uint(k); return r; }
+    }
+    return -1;
+}
+// The face of an edge whose four cells (counterclockwise) have the vertices v, as process_edge in
+// include/lpm/adaptive.h: a coarse leaf covering two of the cells repeats its vertex, which leaves
+// a triangle (out_f[o + 3] = NONE); two distinct vertices leave nothing.
+void emit_face(uint64_t faces, uint o, uint v[4], bool outside) {
+    U32 out_f = U32(faces);
+    uint w[4];
+    int m = 0;
+    for (int k = 0; k < 4; k++) if (m == 0 || w[m - 1] != v[k]) w[m++] = v[k];
+    if (m == 4 && w[3] == w[0]) m = 3;
+    if (m < 3) { out_f.v[o] = NONE; return; }
+    if (m == 3) {
+        if (outside) { const uint t = w[1]; w[1] = w[2]; w[2] = t; }
+        out_f.v[o] = w[0]; out_f.v[o + 1u] = w[1]; out_f.v[o + 2u] = w[2]; out_f.v[o + 3u] = NONE;
+        return;
+    }
+    if (outside) { const uint t = v[1]; v[1] = v[3]; v[3] = t; }
+    out_f.v[o] = v[0]; out_f.v[o + 1u] = v[1]; out_f.v[o + 2u] = v[2];
+    out_f.v[o + 3u] = v[0]; out_f.v[o + 4u] = v[2]; out_f.v[o + 5u] = v[3];
+}
+
+#if STAGE == STAGE_SCATTER
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    const uint l = lin(leaf_xyz(i));
+    P.cell_grid.v[l] = i + 1u;
+    atomicOr(P.cell_bits.v[l >> 5], 1u << (l & 31u));  // not dispatched by a frame
+}
+
+#elif STAGE == STAGE_COMPACT
+void main() {
+    uint w = gl_GlobalInvocationID.x;
+    if (w >= pc.count) return;
+    const bool edges = pc.mode == 1u;
+    uint out_i;
+    if (P.frame != 0u) {
+        // A frame: one invocation per word in use, whose prefix is written here for edge_rank.
+        const uint j = w;
+        w = edges ? P.edge_word_list.v[j] : P.cell_word_list.v[j];
+        out_i = edges ? P.edge_word_prefix.v[j] : P.cell_word_prefix.v[j];
+        if (edges) P.edge_prefix.v[w] = out_i;
+    } else out_i = edges ? P.edge_prefix.v[w] : P.cell_prefix.v[w];
+    uint bits = edges ? P.edge_bits.v[w] : P.cell_bits.v[w];
+    while (bits != 0u) {
+        const uint b = findLSB(bits);
+        bits &= bits - 1u;
+        const uint pos = 32u * w + b;
+        if (edges) P.edges.v[out_i] = pos;
+        else P.leaves.v[out_i] = P.frame != 0u ? out_i : P.cell_grid.v[pos] - 1u;  // a frame lists in cell order
+        out_i++;
+    }
+}
+
+#elif STAGE == STAGE_CORNERS
+// The value of a corner, from the adjacent leaf with the smallest tree (as corner_owner).
+void corner_value(uint key) {
+    const ivec3 c = ivec3(corner_of_key(key));
+    int best = -1;
+    bool any_static = false;
+    for (int k = 0; k < 8; k++) {
+        const ivec3 x = c - ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+        if (!is_leaf(x)) continue;
+        const int id = cell_at(x);
+        any_static = any_static || is_static(uint(id));
+        if (best < 0 || tree_size(uint(id)) < tree_size(uint(best))) best = id;
+    }
+    // A corner of a static cell keeps its static value: the field there is that of T.
+    if (best >= 0 && any_static) P.corner_val.v[key] = P.static_corner_val.v[key];
+    else if (best >= 0) P.corner_val.v[key] = eval_tree(leaf_tree(uint(best)), corner_point(uvec3(c)));
+}
+
+// mode 0: one invocation per corner of the grid. mode 1: one per corner of each leaf; the first of
+// the leaves around a corner lists it. mode 2: one per listed corner (the list is contiguous, so
+// that every subgroup evaluates full: in mode 1 only one invocation in five or so owns its corner).
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    if (pc.mode == 0u) {
+        if (t < pc.count) corner_value(t);
+    } else if (pc.mode == 1u) {
+        bool own = false;
+        uint key = 0u;
+        if (t < pc.count) {
+            const uint i = t >> 3, k = t & 7u;
+            const ivec3 c = ivec3(leaf_xyz(i) + uvec3(k & 1u, (k >> 1) & 1u, (k >> 2) & 1u));
+            int first = -1;
+            for (int j = 0; j < 8 && first < 0; j++) if (is_leaf(c - ivec3(j & 1, (j >> 1) & 1, (j >> 2) & 1))) first = j;
+            own = c - ivec3(first & 1, (first >> 1) & 1, (first >> 2) & 1) == ivec3(leaf_xyz(i));
+            key = corner_key(uvec3(c));
+        }
+        const uint before = subgroupExclusiveAdd(own ? 1u : 0u), total = subgroupAdd(own ? 1u : 0u);
+        uint base = 0u;
+        if (subgroupElect() && total > 0u) base = atomicAdd(P.frame_counts.v[4], total);
+        base = subgroupBroadcastFirst(base);
+        if (own) P.corner_list.v[base + before] = key;
+    } else if (t < P.frame_counts.v[4]) {
+        corner_value(P.corner_list.v[t]);
+    }
+    flush_counters();
+}
+
+#elif STAGE == STAGE_EDGES
+// mode 0: one invocation per edge of the grid; mode 1: one per edge of each leaf, the edge being
+// done by the first of its four cells that is a leaf.
+void main() {
+    uint ekey = gl_GlobalInvocationID.x;
+    if (ekey >= pc.count) return;
+    if (pc.mode == 1u) {
+        const uint i = ekey / 12u, e = ekey % 12u;
+        const int c0 = edge_corners[e][0];
+        const uvec3 corner = leaf_xyz(i) + uvec3(c0 & 1, (c0 >> 1) & 1, (c0 >> 2) & 1);
+        ekey = corner_key(corner) * 3u + e / 4u;
+        int ids[4];
+        edge_cells(ekey, ids);
+        int first = -1;
+        for (int q = 0; q < 4 && first < 0; q++) first = ids[q];
+        if (first != int(i)) return;
+    }
+    const uint axis = ekey % 3u, key = ekey / 3u;
+    const uvec3 c = corner_of_key(key);
+    if (c[axis] >= P.N) return;
+    int ids[4];
+    edge_cells(ekey, ids);
+    if (ids[0] < 0 && ids[1] < 0 && ids[2] < 0 && ids[3] < 0) return;  // not an edge of a leaf
+    uvec3 c1 = c;
+    c1[axis] += 1u;
+    if ((P.corner_val.v[key] < 0.0) != (P.corner_val.v[corner_key(c1)] < 0.0)) {
+        const uint old = atomicOr(P.edge_bits.v[ekey >> 5], 1u << (ekey & 31u));
+        if (P.frame != 0u) {
+            // Each edge has one invocation, so the bit is new; the first in its word marks the word.
+            atomicAdd(P.frame_counts.v[2], 1u);
+            if (old == 0u) {
+                atomicAdd(P.frame_counts.v[3], 1u);
+                atomicOr(P.edge_hi.v[ekey >> 10], 1u << ((ekey >> 5) & 31u));
+            }
+        }
+    }
+}
+
+#elif STAGE == STAGE_CROSS
+void main() {
+    const uint u = gl_GlobalInvocationID.x;
+    if (u < pc.count) {
+        const uint ekey = P.edges.v[u];
+        const uint axis = ekey % 3u, key = ekey / 3u;
+        int ids[4];
+        edge_cells(ekey, ids);
+        int owner = -1;
+        bool any_static = false;
+        for (int q = 0; q < 4; q++) {
+            if (ids[q] < 0) continue;
+            any_static = any_static || is_static(uint(ids[q]));
+            if (owner < 0 || tree_size(uint(ids[q])) < tree_size(uint(owner))) owner = ids[q];
+        }
+        if (any_static) {
+            // An edge of a static cell keeps its static crossing (with marching cubes, static_crossings
+            // are the static vertices, 3 per crossing).
+            const uint su = static_edge_rank(ekey);
+            if (P.mc != 0u) {
+                for (int k = 0; k < 3; k++) P.V.v[3u * u + uint(k)] = P.static_crossings.v[3u * su + uint(k)];
+                P.vtree.v[u] = tree_size(uint(owner));
+            } else for (int k = 0; k < 6; k++) P.crossings.v[6u * u + uint(k)] = P.static_crossings.v[6u * su + uint(k)];
+            flush_counters();
+            return;
+        }
+        const uvec3 tree = leaf_tree(uint(owner));
+        const uvec3 c = corner_of_key(key);
+        uvec3 c1 = c;
+        c1[axis] += 1u;
+        const dvec3 p0 = corner_point(c);
+        dvec3 p1 = p0;
+        p1[axis] += P.size[axis];
+        const double f0 = P.corner_val.v[key], f1 = P.corner_val.v[corner_key(c1)];
+        bool converged;
+        const double t = edge_root(tree, p0, p1, f0, f1, P.max_iters, converged);
+        const dvec3 x = p0 + t * (p1 - p0);
+        if (P.mc != 0u) {  // marching cubes needs no normal: the crossing point is the vertex
+            for (int k = 0; k < 3; k++) P.V.v[3u * u + uint(k)] = x[k];
+            P.vtree.v[u] = tree_size(uint(owner));
+            flush_counters();
+            return;
+        }
+        const dvec3 nrm = crossing_normal(tree, x, P.fd_h, converged, axis, f0);
+        for (int k = 0; k < 3; k++) {
+            P.crossings.v[6u * u + uint(k)] = x[k];
+            P.crossings.v[6u * u + 3u + uint(k)] = nrm[k];
+        }
+    }
+    flush_counters();
+}
+
+#elif STAGE == STAGE_COMP
+int parent_of[12];
+int find_root(int e) {
+    while (parent_of[e] != e) { parent_of[e] = parent_of[parent_of[e]]; e = parent_of[e]; }
+    return e;
+}
+void unite(int a, int b) { a = find_root(a); b = find_root(b); if (a != b) parent_of[a] = b; }
+
+// Manifold dual contouring: one component per set of crossing edges joined through the faces of
+// the cell; on a face with four crossing edges the sign at the face center decides the pairing.
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    uint packed0 = 0xffffffffu, packed1 = 0xffffu, k = 0u, ambiguous = 0u, ncross = 0u, pairing = 0u;
+    if (i < pc.count) {
+        const uint id = P.leaves.v[i];
+        const uvec3 xyz = leaf_xyz(id);
+        bool neg[8];
+        for (int c = 0; c < 8; c++) neg[c] = P.corner_val.v[corner_key(xyz + uvec3(c & 1, (c >> 1) & 1, (c >> 2) & 1))] < 0.0;
+        bool crossing[12];
+        bool any_crossing = false;
+        for (int e = 0; e < 12; e++) {
+            crossing[e] = neg[edge_corners[e][0]] != neg[edge_corners[e][1]];
+            any_crossing = any_crossing || crossing[e];
+            ncross += crossing[e] ? 1u : 0u;
+            parent_of[e] = e;
+        }
+        if (any_crossing) {
+            int edge_of[8][8];
+            for (int a = 0; a < 8; a++) for (int b = 0; b < 8; b++) edge_of[a][b] = -1;
+            for (int e = 0; e < 12; e++) { edge_of[edge_corners[e][0]][edge_corners[e][1]] = e; edge_of[edge_corners[e][1]][edge_corners[e][0]] = e; }
+            const int ob[4] = {0, 1, 1, 0}, oc[4] = {0, 0, 1, 1};
+            for (int axis = 0; axis < 3; axis++) {
+                const int bx = (axis + 1) % 3, cx = (axis + 2) % 3;
+                for (int side = 0; side < 2; side++) {
+                    int corners[4], fe[4], nc = 0;
+                    for (int q = 0; q < 4; q++) corners[q] = (side << axis) | (ob[q] << bx) | (oc[q] << cx);
+                    for (int q = 0; q < 4; q++) { fe[q] = edge_of[corners[q]][corners[(q + 1) % 4]]; nc += crossing[fe[q]] ? 1 : 0; }
+                    if (nc == 2) {
+                        int first = -1;
+                        for (int q = 0; q < 4; q++) if (crossing[fe[q]]) { if (first < 0) first = fe[q]; else unite(first, fe[q]); }
+                    } else if (nc == 4) {
+                        dvec3 center = P.aabb_min.xyz + (dvec3(xyz) + 0.5) * P.size.xyz;
+                        center[axis] = P.aabb_min[axis] + (double(xyz[axis]) + double(side)) * P.size[axis];
+                        const bool sc_in = eval_tree(leaf_tree(id), center) < 0.0;
+                        ambiguous++;
+                        if (sc_in == neg[corners[0]]) { unite(fe[0], fe[1]); unite(fe[2], fe[3]); pairing |= 1u << (2 * axis + side); }
+                        else { unite(fe[3], fe[0]); unite(fe[1], fe[2]); }
+                    }
+                }
+            }
+            int root_id[12];
+            for (int e = 0; e < 12; e++) root_id[e] = -1;
+            for (int e = 0; e < 12; e++) {
+                if (!crossing[e]) continue;
+                const int r = find_root(e);
+                if (root_id[r] < 0) root_id[r] = int(k++);
+                const uint q = uint(root_id[r]);
+                if (e < 8) packed0 = (packed0 & ~(15u << (4 * e))) | (q << (4 * e));
+                else packed1 = (packed1 & ~(15u << (4 * (e - 8)))) | (q << (4 * (e - 8)));
+            }
+        }
+        // With marching cubes each component is one cycle of crossing edges, a polygon of L edges and
+        // L - 2 triangles, and comp holds the pairings of the ambiguous faces.
+        const uint count = P.mc != 0u ? ncross - 2u * k : k;
+        P.comp.v[2u * i] = P.mc != 0u ? pairing : packed0;
+        P.comp.v[2u * i + 1u] = packed1;
+        P.ncomp.v[i] = count;
+        if (P.frame != 0u) P.ncomp_dyn.v[i] = is_static(id) ? 0u : count;
+    }
+    const uint amb = subgroupAdd(ambiguous);
+    if (subgroupElect() && amb > 0u) atomicAdd(P.counters.ambiguous, amb);
+    flush_counters();
+}
+
+#elif STAGE == STAGE_QEF
+uint comp_of(uint i, int e) {
+    const uint w = e < 8 ? P.comp.v[2u * i] : P.comp.v[2u * i + 1u];
+    return (w >> (4 * (e < 8 ? e : e - 8))) & 15u;
+}
+
+// The vertices of leaf i; the projection evaluates the tree, so main() flushes the counters of every
+// invocation afterwards.
+void qef(uint i) {
+    if (i >= pc.count) return;
+    const uint nc = P.ncomp.v[i];
+    if (nc == 0u) return;
+    const uint id = P.leaves.v[i];
+    if (is_static(id)) return;  // the ring keeps its static vertices
+    const uvec3 xyz = leaf_xyz(id);
+    const dvec3 lo = P.aabb_min.xyz + dvec3(xyz) * P.size.xyz, hi = lo + P.size.xyz;
+    const uint base = P.frame != 0u ? P.vbase_dyn.v[i] : P.vbase.v[i];
+    for (uint q = 0u; q < nc; q++) {
+        double ata[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+        dvec3 atb = dvec3(0.0), mass = dvec3(0.0);
+        uint count = 0u;
+        for (int e = 0; e < 12; e++) {
+            if (comp_of(i, e) != q) continue;
+            const uvec3 c0 = xyz + uvec3(edge_corners[e][0] & 1, (edge_corners[e][0] >> 1) & 1, (edge_corners[e][0] >> 2) & 1);
+            const uint u = edge_rank(corner_key(c0) * 3u + uint(e / 4));
+            const dvec3 x = dvec3(P.crossings.v[6u * u], P.crossings.v[6u * u + 1u], P.crossings.v[6u * u + 2u]);
+            const dvec3 n = dvec3(P.crossings.v[6u * u + 3u], P.crossings.v[6u * u + 4u], P.crossings.v[6u * u + 5u]);
+            const double nx = dot(n, x);
+            for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) ata[r][c] += n[r] * n[c];
+            atb += n * nx;
+            mass += x;
+            count++;
+        }
+        mass /= double(count);
+        dvec3 x = qef_solve(ata, atb, mass, lo, hi);
+        // Onto the surface (DCParams::project_vertices), except with the coarse leaves of mesh(), as
+        // adaptive_mesh, which does not project.
+        if (P.project != 0u) {
+            const double h_min = min(P.size.x, min(P.size.y, P.size.z));
+            x = project_vertex(leaf_tree(id), x, lo, hi, P.fd_h, 0.05 * h_min);
+        }
+        for (int k = 0; k < 3; k++) P.V.v[3u * (base + q) + uint(k)] = x[k];
+        P.vtree.v[base + q] = tree_size(id);
+    }
+}
+
+void main() {
+    qef(gl_GlobalInvocationID.x);
+    flush_counters();
+}
+
+#elif STAGE == STAGE_FACES
+// mode 1: the static mesh of a dynamic scene with coarse leaves, whose static octree has its finest
+// leaves also inside the coarse leaves. There, and in its frames, a cell inside a coarse leaf gives
+// the vertex of the coarse leaf (unless the frame dissolves it), and an edge with no finest leaf
+// around it is left to COARSE_FACES.
+void main() {
+    const uint u = gl_GlobalInvocationID.x;
+    if (u >= pc.count) return;
+    const uint ekey = P.edges.v[u];
+    const uint axis = ekey % 3u, key = ekey / 3u;
+    const uvec3 corner = corner_of_key(key);
+    ivec3 cs[4];
+    cells_around(ivec3(corner), axis, cs);
+    const bool coarse_first = P.coarse_on != 0u && (pc.mode == 1u || P.frame != 0u);
+    uint v[4];
+    bool any_changed = false, any_coarse = false, any_fine = false;
+    for (int q = 0; q < 4; q++) {
+        bool dissolved = false;
+        if (coarse_first) {
+            uint lvl;
+            const int r = coarse_cover(P.depth, cs[q], lvl);
+            if (r >= 0) {
+                if (P.frame == 0u || P.dissolved.v[uint(r)] == 0u) {
+                    v[q] = P.nv_fine + uint(r);
+                    any_coarse = true;
+                    continue;
+                }
+                dissolved = true;
+            }
+        }
+        const int id = cell_at(cs[q]);
+        if (id < 0) {
+            // A cell inside a coarse leaf gives the vertex of the coarse leaf (mesh()).
+            uint lvl;
+            const int r = P.coarse_on != 0u && !coarse_first ? coarse_cover(P.depth, cs[q], lvl) : -1;
+            if (r < 0) { P.F.v[6u * u] = NONE; return; }
+            v[q] = P.nv_fine + uint(r);
+            any_coarse = true;
+            continue;
+        }
+        any_fine = true;
+        const uvec3 xyz = leaf_xyz(uint(id));
+        const uint rank = leaf_rank(lin(xyz));
+        const bool st = is_static(uint(id));
+        any_changed = any_changed || !st || dissolved;
+        const ivec3 bits = ivec3(corner) - ivec3(xyz);
+        const int b = axis == 0u ? 1 : 0, c = axis == 2u ? 1 : 2;
+        const int le = 4 * int(axis) + bits[b] + 2 * bits[c];
+        const uint w = le < 8 ? P.comp.v[2u * rank] : P.comp.v[2u * rank + 1u];
+        const uint cq = (w >> (4 * (le < 8 ? le : le - 8))) & 15u;
+        if (cq == 15u) { P.F.v[6u * u] = NONE; return; }
+        if (P.frame == 0u) v[q] = P.vbase.v[rank] + cq;
+        else if (st) v[q] = P.static_vbase.v[static_leaf_rank(lin(xyz))] + cq;  // the static vertex
+        else v[q] = P.nv_static + P.vbase_dyn.v[rank] + cq;
+    }
+    if (coarse_first && P.frame == 0u && !any_fine) { P.F.v[6u * u] = NONE; return; }
+    // A frame keeps only the faces with a dynamic or dissolved cell; the others are in the static mesh.
+    if (P.frame != 0u && !any_changed) { P.F.v[6u * u] = NONE; return; }
+    if (any_coarse) { emit_face(uint64_t(P.F), 6u * u, v, P.corner_val.v[key] >= 0.0); return; }
+    if (P.corner_val.v[key] >= 0.0) { const uint t = v[1]; v[1] = v[3]; v[3] = t; }
+    P.F.v[6u * u] = v[0]; P.F.v[6u * u + 1u] = v[1]; P.F.v[6u * u + 2u] = v[2];
+    P.F.v[6u * u + 3u] = v[0]; P.F.v[6u * u + 4u] = v[2]; P.F.v[6u * u + 5u] = v[3];
+}
+#elif STAGE == STAGE_MC_FACES
+ivec3 corner_pos(int c) { return ivec3(c & 1, (c >> 1) & 1, (c >> 2) & 1); }
+
+// The faces of the cell are 2 axis + side; the two faces of edge e are those of its other axes.
+int edge_face(int e, int slot) {
+    const int a = e / 4, c0 = edge_corners[e][0];
+    const int x = slot == 0 ? (a == 0 ? 1 : 0) : (a == 2 ? 1 : 2);
+    return 2 * x + ((c0 >> x) & 1);
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    const uint id = P.leaves.v[i];
+    // A frame meshes only its new cells, after the kept static triangles in out_F; its new vertices
+    // follow the static ones.
+    const bool frame = P.frame != 0u;
+    if (frame && is_static(id)) return;
+    const uint nt = P.ncomp.v[i];
+    if (nt == 0u) return;
+    const uvec3 xyz = leaf_xyz(id);
+    U32 out_f = frame ? P.out_F : P.F;
+    const uint vbias = frame ? P.nv_static : 0u;
+    bool neg[8];
+    for (int c = 0; c < 8; c++) neg[c] = P.corner_val.v[corner_key(xyz + uvec3(corner_pos(c)))] < 0.0;
+    bool crossing[12];
+    int partner[12][2];
+    for (int e = 0; e < 12; e++) {
+        crossing[e] = neg[edge_corners[e][0]] != neg[edge_corners[e][1]];
+        partner[e][0] = -1;
+        partner[e][1] = -1;
+    }
+    int edge_of[8][8];
+    for (int a = 0; a < 8; a++) for (int b = 0; b < 8; b++) edge_of[a][b] = -1;
+    for (int e = 0; e < 12; e++) { edge_of[edge_corners[e][0]][edge_corners[e][1]] = e; edge_of[edge_corners[e][1]][edge_corners[e][0]] = e; }
+    // The pairings of COMP, face by face (the bits of comp say which way the ambiguous ones went).
+    const uint pairing = P.comp.v[2u * i];
+    const int ob[4] = {0, 1, 1, 0}, oc[4] = {0, 0, 1, 1};
+    for (int axis = 0; axis < 3; axis++) {
+        const int bx = (axis + 1) % 3, cx = (axis + 2) % 3;
+        for (int side = 0; side < 2; side++) {
+            const int fid = 2 * axis + side;
+            int corners[4], fe[4], nc = 0;
+            for (int q = 0; q < 4; q++) corners[q] = (side << axis) | (ob[q] << bx) | (oc[q] << cx);
+            for (int q = 0; q < 4; q++) { fe[q] = edge_of[corners[q]][corners[(q + 1) % 4]]; nc += crossing[fe[q]] ? 1 : 0; }
+            int pa[2], pb[2], np = 0;
+            if (nc == 2) {
+                int first = -1;
+                for (int q = 0; q < 4; q++) if (crossing[fe[q]]) { if (first < 0) first = fe[q]; else { pa[0] = first; pb[0] = fe[q]; np = 1; } }
+            } else if (nc == 4) {
+                np = 2;
+                if ((pairing & (1u << fid)) != 0u) { pa[0] = fe[0]; pb[0] = fe[1]; pa[1] = fe[2]; pb[1] = fe[3]; }
+                else { pa[0] = fe[3]; pb[0] = fe[0]; pa[1] = fe[1]; pb[1] = fe[2]; }
+            }
+            for (int k = 0; k < np; k++) {
+                partner[pa[k]][edge_face(pa[k], 0) == fid ? 0 : 1] = pb[k];
+                partner[pb[k]][edge_face(pb[k], 0) == fid ? 0 : 1] = pa[k];
+            }
+        }
+    }
+    // Every cycle as a fan; the vertex of a crossing is its rank. The cycle is walked one way and the
+    // fan reversed when its normal (Newell, from the crossing points) points against the direction in
+    // which f grows along its edges. The apex of the fan is a crossing whose two faces hold no other
+    // segment of the cycle: from a crossing on a face that the cycle crosses twice, a triangle would
+    // lie flat in that face, and the neighbor cell would draw it too, reversed.
+    bool done[12];
+    for (int e = 0; e < 12; e++) done[e] = false;
+    const uint base = 3u * (frame ? P.keep_prefix.v[P.n_static_edges] + P.vbase_dyn.v[i] : P.vbase.v[i]);
+    uint t = 0u;
+    for (int e0 = 0; e0 < 12; e0++) {
+        if (!crossing[e0] || done[e0]) continue;
+        uint loop[12];
+        int seg_face[12];  // the face of the segment from loop[k] to loop[k + 1]
+        int n = 0, cur = e0, face = edge_face(e0, 1);
+        ivec3 grow = ivec3(0);
+        while (cur >= 0 && n < 12) {
+            done[cur] = true;
+            loop[n] = edge_rank(corner_key(xyz + uvec3(corner_pos(edge_corners[cur][0]))) * 3u + uint(cur / 4));
+            grow[cur / 4] += neg[edge_corners[cur][0]] ? 1 : -1;
+            const int sl = edge_face(cur, 0) == face ? 1 : 0;
+            face = edge_face(cur, sl);
+            seg_face[n++] = face;
+            cur = partner[cur][sl];
+            if (cur == e0) break;
+        }
+        // Triangle k of the fan from s, (s, s + k, s + k + 1), lies in a face when segment s + k is on
+        // one of the two faces of crossing s; for k = 1 and n - 2 it cannot (two edges share one face).
+        int apex = 0;
+        for (int s = 0; s < n; s++) {
+            bool in_face = false;
+            for (int k = 2; k <= n - 3; k++) {
+                const int sf = seg_face[(s + k) % n];
+                if (sf == seg_face[s] || sf == seg_face[(s + n - 1) % n]) in_face = true;
+            }
+            if (!in_face) { apex = s; break; }
+        }
+        dvec3 nrm = dvec3(0.0);
+        const dvec3 o = dvec3(P.V.v[3u * loop[0]], P.V.v[3u * loop[0] + 1u], P.V.v[3u * loop[0] + 2u]);
+        dvec3 prev = dvec3(0.0);
+        for (int k = 1; k < n; k++) {
+            const dvec3 q = dvec3(P.V.v[3u * loop[k]], P.V.v[3u * loop[k] + 1u], P.V.v[3u * loop[k] + 2u]) - o;
+            nrm += cross(prev, q);
+            prev = q;
+        }
+        // On the face of the first segment, the inward normal crossed with the direction in which f
+        // grows along the first crossing edge gives the way the cycle runs (marching cubes keeps the
+        // inside of the surface on one hand); the Newell normal decides only when that segment has no
+        // extent in that direction (a crossing at a corner).
+        dvec3 inward = dvec3(0.0), gd = dvec3(0.0);
+        inward[seg_face[0] / 2] = (seg_face[0] & 1) != 0 ? -1.0 : 1.0;
+        gd[e0 / 4] = neg[edge_corners[e0][0]] ? 1.0 : -1.0;
+        const dvec3 p1 = dvec3(P.V.v[3u * loop[1]], P.V.v[3u * loop[1] + 1u], P.V.v[3u * loop[1] + 2u]);
+        const double way = dot(p1 - o, cross(inward, gd));
+        const bool flip = way != 0.0 ? way < 0.0 : dot(nrm, dvec3(grow)) < 0.0;
+        for (int k = 1; k + 1 < n && t < nt; k++) {
+            const uint c1 = loop[(apex + k) % n], c2 = loop[(apex + k + 1) % n];
+            const uint b1 = flip ? c2 : c1, b2 = flip ? c1 : c2;
+            out_f.v[base + 3u * t] = vbias + loop[apex]; out_f.v[base + 3u * t + 1u] = vbias + b1; out_f.v[base + 3u * t + 2u] = vbias + b2;
+            t++;
+        }
+    }
+}
+
+#elif STAGE == STAGE_TOUCH
+// One workgroup per culled cell: the static leaves of the finest level inside it.
+void main() {
+    const uint k = gl_WorkGroupID.x;
+    if (k >= P.patch_args.v[7]) return;
+    const uvec3 c = uvec3(P.culled.v[4u * k], P.culled.v[4u * k + 1u], P.culled.v[4u * k + 2u]);
+    const uint side = 1u << (P.depth - P.culled.v[4u * k + 3u]);
+    const uvec3 base = c * side;
+    const uint total = side * side * side;
+    for (uint t = gl_LocalInvocationID.x; t < total; t += gl_WorkGroupSize.x) {
+        const uvec3 x = base + uvec3(t / (side * side), (t / side) % side, t % side);
+        const uint l = lin(x);
+        if (BIT(P.static_cell_bits, l)) {
+            atomicOr(P.touched_bits.v[l >> 5], 1u << (l & 31u));
+            uint lvl;
+            const int r = P.coarse_on != 0u ? coarse_cover(P.depth, ivec3(x), lvl) : -1;
+            if (r >= 0) P.dissolved.v[uint(r)] = 1u;  // its coarse leaf is meshed by its finest leaves
+        }
+    }
+}
+
+#elif STAGE == STAGE_DYNBITS
+// mode 0: the bits of the dynamic leaves, in dyn_bits and in the region bitset (cell_bits).
+// mode 1, after STAGE_REGION: each dynamic leaf into leaf_cells, at its rank in the region.
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= P.patch_args.v[6]) return;
+    const uint l = lin(uvec3(P.dyn_cells.v[8u * i], P.dyn_cells.v[8u * i + 1u], P.dyn_cells.v[8u * i + 2u]));
+    if (pc.mode == 0u) {
+        atomicOr(P.dyn_bits.v[l >> 5], 1u << (l & 31u));
+        set_region_bit(l);
+        uint lvl;
+        const ivec3 c = ivec3(P.dyn_cells.v[8u * i], P.dyn_cells.v[8u * i + 1u], P.dyn_cells.v[8u * i + 2u]);
+        const int r = P.coarse_on != 0u ? coarse_cover(P.depth, c, lvl) : -1;
+        if (r >= 0) P.dissolved.v[uint(r)] = 1u;  // its coarse leaf is meshed by its finest leaves
+    } else {
+        const uint r = leaf_rank(l);
+        for (uint k = 0u; k < 8u; k++) P.leaf_cells.v[8u * r + k] = P.dyn_cells.v[8u * i + k];
+        P.leaf_cells.v[8u * r + 3u] = 0u;
+    }
+}
+
+#elif STAGE == STAGE_RING
+// Static leaves sharing a corner with a dynamic leaf, unless dynamic or swallowed, join the region.
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= P.patch_args.v[6]) return;
+    const ivec3 c = ivec3(P.dyn_cells.v[8u * i], P.dyn_cells.v[8u * i + 1u], P.dyn_cells.v[8u * i + 2u]);
+    for (int d = 0; d < 27; d++) {
+        if (d == 13) continue;
+        const ivec3 x = c + ivec3(d / 9 - 1, (d / 3) % 3 - 1, d % 3 - 1);
+        if (any(lessThan(x, ivec3(0))) || any(greaterThanEqual(x, ivec3(int(P.N))))) continue;
+        const uint l = lin(uvec3(x));
+        if (!BIT(P.static_cell_bits, l) || BIT(P.dyn_bits, l) || BIT(P.touched_bits, l)) continue;
+        set_region_bit(l);
+    }
+}
+
+#elif STAGE == STAGE_REGION
+// The region cells in increasing cell order, one invocation per word of cell_bits in use (whose
+// prefix, written here, serves leaf_rank): the static ring cells (flag 1) with their static
+// trees; the dynamic leaves go to their places in STAGE_DYNBITS mode 1.
+void main() {
+    const uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.count) return;
+    const uint w = P.cell_word_list.v[j];
+    uint bits = P.cell_bits.v[w];
+    uint out_i = P.cell_word_prefix.v[j];
+    P.cell_prefix.v[w] = out_i;
+    while (bits != 0u) {
+        const uint b = findLSB(bits);
+        bits &= bits - 1u;
+        const uint l = 32u * w + b;
+        if (!BIT(P.dyn_bits, l)) {
+            const uint id = P.static_leaves.v[static_leaf_rank(l)];
+            for (uint k = 0u; k < 8u; k++) P.leaf_cells.v[8u * out_i + k] = P.static_leaf_cells.v[8u * id + k];
+            P.leaf_cells.v[8u * out_i + 3u] = 1u;
+        }
+        out_i++;
+    }
+}
+
+#elif STAGE == STAGE_KEEP
+void main() {
+    const uint u = gl_GlobalInvocationID.x;
+    if (u >= pc.count) return;
+    if (P.mc != 0u) {
+        // Marching cubes: the triangles of static leaf u stay unless the leaf is dynamic or swallowed.
+        const uint id = P.static_leaves.v[u];
+        const uint l = lin(uvec3(P.static_leaf_cells.v[8u * id], P.static_leaf_cells.v[8u * id + 1u], P.static_leaf_cells.v[8u * id + 2u]));
+        const bool gone = BIT(P.dyn_bits, l) || BIT(P.touched_bits, l);
+        P.keep_static.v[u] = gone ? 0u : P.static_vbase.v[u + 1u] - P.static_vbase.v[u];
+        return;
+    }
+    // With coarse leaves the static faces are those of the finest edges (es of them), then those of
+    // the edges of the coarse leaves (12 per leaf, by rank), which invocation es + 12 k + e handles
+    // for the record k: such a face stays unless a coarse leaf around its edge is dissolved.
+    const uint es = P.n_static_edges - (P.coarse_on != 0u ? 12u * P.n_coarse : 0u);
+    if (u >= es) {
+        const uint k = (u - es) / 12u, e = (u - es) % 12u;
+        const uvec3 xyz = uvec3(P.coarse_records.v[12u * k], P.coarse_records.v[12u * k + 1u], P.coarse_records.v[12u * k + 2u]);
+        const uint level = P.coarse_records.v[12u * k + 3u] & 0xffu;
+        const uint slot = es + 12u * uint(coarse_rank(level, xyz)) + e;
+        uint kc = 0u;
+        if (P.static_F.v[6u * slot] != NONE) {
+            kc = 1u;
+            const int c0 = edge_corners[e][0];
+            ivec3 cs[4];
+            cells_around(ivec3(xyz) + ivec3(c0 & 1, (c0 >> 1) & 1, (c0 >> 2) & 1), uint(e / 4u), cs);
+            for (int q = 0; q < 4; q++) {
+                uint lvl;
+                const int r = coarse_cover(level, cs[q], lvl);
+                if (r >= 0 && P.dissolved.v[uint(r)] != 0u) kc = 0u;
+            }
+        }
+        P.keep_static.v[slot] = kc;
+        return;
+    }
+    uint keep = 0u;
+    if (P.static_F.v[6u * u] != NONE) {
+        keep = 1u;
+        const uint ekey = P.static_edges.v[u];
+        const uint axis = ekey % 3u;
+        const ivec3 c = ivec3(corner_of_key(ekey / 3u));
+        const ivec2 off[4] = {ivec2(-1, -1), ivec2(0, -1), ivec2(0, 0), ivec2(-1, 0)};
+        for (int q = 0; q < 4; q++) {
+            ivec3 x = c;
+            if (axis == 0u) { x.y += off[q].x; x.z += off[q].y; }
+            else if (axis == 1u) { x.z += off[q].x; x.x += off[q].y; }
+            else { x.x += off[q].x; x.y += off[q].y; }
+            const uint l = lin(uvec3(x));  // the four cells of a static quad are leaves, so inside the grid
+            if (BIT(P.dyn_bits, l) || BIT(P.touched_bits, l)) keep = 0u;
+            uint lvl;
+            const int r = P.coarse_on != 0u ? coarse_cover(P.depth, x, lvl) : -1;
+            if (r >= 0 && P.dissolved.v[uint(r)] != 0u) keep = 0u;
+        }
+    }
+    P.keep_static.v[u] = keep;
+}
+
+#elif STAGE == STAGE_NEWFLAGS
+void main() {
+    const uint u = gl_GlobalInvocationID.x;
+    if (u >= pc.count) return;
+    P.new_flags.v[u] = P.F.v[6u * u] != NONE ? 1u : 0u;
+}
+
+#elif STAGE == STAGE_ASSEMBLE
+// mode 0: the kept static quads; mode 1: the new quads after them.
+void main() {
+    const uint u = gl_GlobalInvocationID.x;
+    if (u >= pc.count) return;
+    if (P.mc != 0u) {
+        // Marching cubes: the triangles of the kept static leaf u (MC_FACES wrote the new ones after them).
+        const uint n = 3u * P.keep_static.v[u], src = 3u * P.static_vbase.v[u], dst = 3u * P.keep_prefix.v[u];
+        for (uint k = 0u; k < n; k++) P.out_F.v[dst + k] = P.static_F.v[src + k];
+        return;
+    }
+    // Next to a coarse leaf a face may be one triangle, and the other of its slot is NONE: the
+    // vertex shader of the viewer drops it, and empty_triangles counts it.
+    uint empty = 0u;
+    if (pc.mode == 0u) {
+        if (P.keep_static.v[u] == 0u) return;
+        const uint o = 6u * P.keep_prefix.v[u];
+        for (uint k = 0u; k < 6u; k++) P.out_F.v[o + k] = P.static_F.v[6u * u + k];
+        for (uint t = 0u; t < 6u; t += 3u) empty += P.static_F.v[6u * u + t] == NONE || P.static_F.v[6u * u + t + 1u] == NONE || P.static_F.v[6u * u + t + 2u] == NONE ? 1u : 0u;
+    } else {
+        if (P.new_flags.v[u] == 0u) return;
+        const uint o = 6u * (P.keep_prefix.v[P.n_static_edges] + P.new_prefix.v[u]);
+        for (uint k = 0u; k < 6u; k++) P.out_F.v[o + k] = P.F.v[6u * u + k];
+        for (uint t = 0u; t < 6u; t += 3u) empty += P.F.v[6u * u + t] == NONE || P.F.v[6u * u + t + 1u] == NONE || P.F.v[6u * u + t + 2u] == NONE ? 1u : 0u;
+    }
+    const uint e = subgroupAdd(empty);
+    if (subgroupElect() && e > 0u) atomicAdd(P.counters.empty_triangles, e);
+}
+#elif STAGE == STAGE_CLEAR
+// The start of a frame: zero what the previous one set, from its lists. mode 0: one invocation per
+// region cell (cell grid, region, dynamic and second-level bits); mode 1: one per crossing edge;
+// mode 2: one workgroup per swallowed cell (its static leaves in touched_bits, as TOUCH).
+void main() {
+    if (pc.mode == 2u) {
+        const uint k = gl_WorkGroupID.x;
+        if (k >= pc.count) return;
+        const uvec3 c = uvec3(P.culled.v[4u * k], P.culled.v[4u * k + 1u], P.culled.v[4u * k + 2u]);
+        const uint side = 1u << (P.depth - P.culled.v[4u * k + 3u]);
+        const uvec3 base = c * side;
+        const uint total = side * side * side;
+        for (uint t = gl_LocalInvocationID.x; t < total; t += gl_WorkGroupSize.x)
+            P.touched_bits.v[lin(base + uvec3(t / (side * side), (t / side) % side, t % side)) >> 5] = 0u;
+        return;
+    }
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    if (pc.mode == 0u) {
+        const uint l = lin(leaf_xyz(i));
+        P.cell_bits.v[l >> 5] = 0u;
+        P.dyn_bits.v[l >> 5] = 0u;
+        P.cell_hi.v[l >> 10] = 0u;
+    } else {
+        const uint k = P.edges.v[i];
+        P.edge_bits.v[k >> 5] = 0u;
+        P.edge_hi.v[k >> 10] = 0u;
+    }
+}
+
+#elif STAGE == STAGE_LIST
+// One invocation per word of the second level (prefix sums in *_hi_prefix): the words in use in
+// increasing order, with their number of set bits. mode 0: region cells; mode 1: crossing edges.
+void main() {
+    const uint hw = gl_GlobalInvocationID.x;
+    if (hw >= pc.count) return;
+    const bool edges = pc.mode == 1u;
+    uint bits = edges ? P.edge_hi.v[hw] : P.cell_hi.v[hw];
+    uint out_i = edges ? P.edge_hi_prefix.v[hw] : P.cell_hi_prefix.v[hw];
+    while (bits != 0u) {
+        const uint b = findLSB(bits);
+        bits &= bits - 1u;
+        const uint w = 32u * hw + b;
+        if (edges) {
+            P.edge_word_list.v[out_i] = w;
+            P.edge_word_count.v[out_i] = bitCount(P.edge_bits.v[w]);
+        } else {
+            P.cell_word_list.v[out_i] = w;
+            P.cell_word_count.v[out_i] = bitCount(P.cell_bits.v[w]);
+        }
+        out_i++;
+    }
+}
+
+#elif STAGE == STAGE_COARSE_VERT
+// One invocation per coarse leaf: its vertex, after those of the finest leaves.
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.count) return;
+    const uvec3 xyz = uvec3(P.coarse_records.v[12u * k], P.coarse_records.v[12u * k + 1u], P.coarse_records.v[12u * k + 2u]);
+    const uint r = P.nv_fine + uint(coarse_rank(P.coarse_records.v[12u * k + 3u] & 0xffu, xyz));
+    F64 rv = F64(uint64_t(P.coarse_records) + 48ul * uint64_t(k) + 16ul);
+    for (uint a = 0u; a < 3u; a++) P.V.v[3u * r + a] = rv.v[a];
+    P.vtree.v[r] = 1u;
+}
+
+#elif STAGE == STAGE_COARSE_FACES
+// One invocation per edge of each coarse leaf. An edge that crosses the surface and that no
+// smaller leaf touches (every cell around it, at the level of the leaf, is a coarse leaf or lies in
+// one) gives a face, made by the first of its four cells that is a coarse leaf of this level: the
+// edges of the recursion of Ju et al. in adaptive.h that the finest edges do not cover.
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.count) return;
+    const uint k = t / 12u, e = t % 12u;
+    const uvec3 xyz = uvec3(P.coarse_records.v[12u * k], P.coarse_records.v[12u * k + 1u], P.coarse_records.v[12u * k + 2u]);
+    const uint level = P.coarse_records.v[12u * k + 3u] & 0xffu, neg = P.coarse_records.v[12u * k + 3u] >> 8;
+    const uint o = 6u * (12u * uint(coarse_rank(level, xyz)) + e);
+    const int c0 = edge_corners[e][0], c1 = edge_corners[e][1];
+    const bool in0 = ((neg >> c0) & 1u) != 0u, in1 = ((neg >> c1) & 1u) != 0u;
+    if (in0 == in1) { P.coarse_F.v[o] = NONE; return; }
+    ivec3 cs[4];
+    cells_around(ivec3(xyz) + ivec3(c0 & 1, (c0 >> 1) & 1, (c0 >> 2) & 1), e / 4u, cs);
+    uint v[4];
+    int first = -1;
+    for (int q = 0; q < 4; q++) {
+        uint lvl;
+        const int r = coarse_cover(level, cs[q], lvl);
+        if (r < 0) { P.coarse_F.v[o] = NONE; return; }  // a smaller leaf touches the edge
+        if (lvl == level && first < 0) first = q;
+        v[q] = P.nv_fine + uint(r);
+    }
+    if (cs[first] != ivec3(xyz)) { P.coarse_F.v[o] = NONE; return; }
+    emit_face(uint64_t(P.coarse_F), o, v, !in0);
+}
+
+#elif STAGE == STAGE_DISSOLVE
+// One workgroup per coarse leaf (record k): when the frame dissolves it, its static leaves of the
+// finest level, and those within one cell around it, join the region (not the dynamic or swallowed
+// ones), so that the frame meshes it by them and remakes the faces around it.
+void main() {
+    const uint k = gl_WorkGroupID.x;
+    if (k >= pc.count) return;
+    const uvec3 xyz = uvec3(P.coarse_records.v[12u * k], P.coarse_records.v[12u * k + 1u], P.coarse_records.v[12u * k + 2u]);
+    const uint level = P.coarse_records.v[12u * k + 3u] & 0xffu;
+    const int r = coarse_rank(level, xyz);
+    if (r < 0 || P.dissolved.v[uint(r)] == 0u) return;
+    // The box of the leaf and one cell around it, within the grid, by rows along z: with cells in
+    // row-major order a row is a run of consecutive bits, taken by words of 32 cells.
+    const uint side = 1u << (P.depth - level);
+    const ivec3 lo = max(ivec3(xyz * side) - ivec3(1), ivec3(0)), hi = min(ivec3(xyz * side + side + 1u), ivec3(int(P.N)));
+    const uint ny = uint(hi.y - lo.y), rows = uint(hi.x - lo.x) * ny, len = uint(hi.z - lo.z);
+    for (uint t = gl_LocalInvocationID.x; t < rows; t += gl_WorkGroupSize.x) {
+        const uint l0 = lin(uvec3(uint(lo.x) + t / ny, uint(lo.y) + t % ny, uint(lo.z))), l1 = l0 + len - 1u;
+        for (uint w = l0 >> 5; w <= (l1 >> 5); w++) {
+            uint m = 0xffffffffu;
+            if (w == (l0 >> 5)) m &= 0xffffffffu << (l0 & 31u);
+            if (w == (l1 >> 5)) m &= 0xffffffffu >> (31u - (l1 & 31u));
+            m &= P.static_cell_bits.v[w] & ~P.dyn_bits.v[w] & ~P.touched_bits.v[w];
+            if (m != 0u) set_region_bits(w, m);
+        }
+    }
+}
+#endif

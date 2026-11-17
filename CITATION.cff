@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below, together with the paper it builds on."
+title: "Lipschitz pruning meshing: meshing smooth CSG signed distance fields with Lipschitz pruning"
+authors:
+  - family-names: Allara
+    given-names: Lucas
+    affiliation: "Universidad Torcuato Di Tella"
+date-released: 2026-11-17
+license: MIT
+repository-code: "https://github.com/Lucas-Allara/Lipschitz-pruning-meshing"
+abstract: >-
+  An extension of Lipschitz pruning (Barbier et al., Eurographics 2025) from rendering to meshing:
+  a sparse octree whose cells each evaluate only the expression tree pruned for them, dual
+  contouring with coarse leaves, marching cubes on the octree leaves, and a dynamic update that
+  re-meshes only the region a moving primitive reaches, on the CPU and in Vulkan compute on the GPU.
+keywords:
+  - signed distance fields
+  - constructive solid geometry
+  - Lipschitz pruning
+  - dual contouring
+  - marching cubes
+  - octree
+  - GPU
+  - Vulkan
+references:
+  - type: article
+    title: "Lipschitz Pruning: Hierarchical Simplification of Primitive-Based SDFs"
+    authors:
+      - family-names: Barbier
+        given-names: Wilhem
+      - family-names: Sanchez
+        given-names: Mathieu
+      - family-names: Paris
+        given-names: Axel
+      - family-names: Michel
+        given-names: Élie
+      - family-names: Lambert
+        given-names: Thibaud
+      - family-names: Boubekeur
+        given-names: Tamy
+      - family-names: Paulin
+        given-names: Mathias
+      - family-names: Thonat
+        given-names: Théo
+    journal: "Computer Graphics Forum"
+    volume: 44
+    issue: 2
+    start: e70057
+    year: 2025
+    doi: 10.1111/cgf.70057

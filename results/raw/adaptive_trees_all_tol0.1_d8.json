@@ -1,0 +1,13 @@
+{
+  "scene": "scenes/trees.json", "method": "lipschitz", "depth": 8, "threads": 32, "inherit": true, "analytic": false, "dense": false,
+  "nodes": 371, "prims": 186, "ops": 185, "tree_height": 42,
+  "time_load": 0.002795, "time_octree": 0.092912, "time_mesh": 0.725830, "time_dense": 0.000000, "time_total": 0.919893,
+  "time_dc_index": 0.000000, "time_dc_corners": 0.000000, "time_dc_edges": 0.000000, "time_dc_qef": 0.000000, "time_dc_faces": 0.000000,
+  "octree_prim_evals": 0, "octree_op_evals": 0, "octree_prim_ivals": 0, "octree_op_ivals": 0,
+  "mesh_prim_evals": 15597564, "mesh_op_evals": 11949880,
+  "prim_evals": 15597564, "node_evals": 27547444,
+  "cells": 205437, "corners": 0, "crossings": 0, "vertices": 134657, "triangles": 269302, "analytic_hits": 0,
+  "pool_entries": 0, "pool_bytes": 0, "peak_rss_mb": 808.5,
+  "adaptive": {"tol": 0.1, "single_primitive_only": false, "min_depth": 3, "fine_leaves": 329755, "leaves": 205437, "collapsed": 22206, "time_hermite": 0.473141, "time_collapse": 0.187587, "time_faces": 0.065102, "leaves_per_level": [0, 0, 0, 0, 0, 0, 1, 22197, 183239]},
+  "levels": []
+}

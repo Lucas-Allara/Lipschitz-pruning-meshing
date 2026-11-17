@@ -1,0 +1,37 @@
+// Arguments of the indirect dispatches of the dynamic descent, from the counters of the previous
+// level, so that all the levels of a frame run in one submission without waiting for the host.
+// mode 0, a level of shaders/dyn_prune.comp: workgroups of the narrow kernel, of the wide one,
+// the number of parents, and 1 when the previous level did not fit in its buffers (the descent
+// stops there; the host grows them and runs the frame again).
+// mode 1, the patch of shaders/dc.comp: one workgroup per swallowed cell (TOUCH), the workgroups
+// of DYNBITS and RING, the number of dynamic leaves and of swallowed cells.
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+
+layout(push_constant) uniform PC {
+    U32 counters;      // of the previous level: cells, entries, unused, largest tree, ...
+    U32 args;          // 8 uints
+    U32 culled_count;  // swallowed cells recorded by all the levels
+    uint cell_cap, entry_cap, wide, culled_cap, mode;
+} pc;
+
+void main() {
+    const uint cells = pc.counters.v[0], entries = pc.counters.v[1], max_tree = pc.counters.v[3];
+    const bool overflow = cells > pc.cell_cap || entries > pc.entry_cap;
+    const uint n = overflow ? 0u : cells;
+    if (pc.mode == 0u) {
+        pc.args.v[0] = (8u * n + 63u) / 64u; pc.args.v[1] = 1u; pc.args.v[2] = 1u;
+        pc.args.v[3] = max_tree > pc.wide ? 8u * n : 0u; pc.args.v[4] = 1u; pc.args.v[5] = 1u;
+        pc.args.v[6] = n;
+        pc.args.v[7] = overflow ? 1u : 0u;
+    } else {
+        const uint culled = min(pc.culled_count.v[0], pc.culled_cap);
+        pc.args.v[0] = culled; pc.args.v[1] = 1u; pc.args.v[2] = 1u;
+        pc.args.v[3] = (n + 63u) / 64u; pc.args.v[4] = 1u; pc.args.v[5] = 1u;
+        pc.args.v[6] = n;
+        pc.args.v[7] = culled;
+    }
+}

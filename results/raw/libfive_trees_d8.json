@@ -1,0 +1,3 @@
+{"scene": "/home/lucas/Desktop/Lipschitz-pruning-meshing/scenes/trees.json", "method": "libfive", "depth": 8, "threads": 32, "max_err": 1e-08, "min_feature": 0.00914153906,
+ "nodes": 371, "prims": 186, "time_tree": 0.001706, "time_render": 1.211654, "time_total": 1.288981,
+ "vertices": 152636, "triangles": 305260, "peak_rss_mb": 1472.7}

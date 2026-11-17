@@ -1,0 +1,22 @@
+build/
+build-*/
+.venv/
+__pycache__/
+*.aux
+*.log
+*.out
+results/meshes/*.obj
+results/meshes/*.ply
+results/meshes/*.f32
+results/run_log_*.txt
+results/raw/hausdorff.json
+# CAD scenes converted from InverseCSG, which has no license: scenes/inversecsg/README.md tells how
+# to regenerate them.
+scenes/inversecsg/*.json
+# Outputs of the commands of the README, written in the root.
+/frames/
+/orbit/
+/*.obj
+/*.ply
+/*.gif
+/*.f32

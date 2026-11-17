@@ -1,0 +1,22 @@
+{
+  "scene": "scenes/synthetic/fluid_n5000_k0.05.json", "method": "lipschitz", "depth": 8, "threads": 32, "inherit": true, "analytic": false, "dense": false,
+  "nodes": 9999, "prims": 5000, "ops": 4999, "tree_height": 14,
+  "time_load": 0.054574, "time_octree": 1.827662, "time_mesh": 0.763010, "time_dense": 0.000000, "time_total": 2.761573,
+  "time_dc_index": 0.066246, "time_dc_corners": 0.121586, "time_dc_edges": 0.531549, "time_dc_qef": 0.021777, "time_dc_faces": 0.021844,
+  "octree_prim_evals": 342037184, "octree_op_evals": 341276231, "octree_prim_ivals": 0, "octree_op_ivals": 0,
+  "mesh_prim_evals": 661365726, "mesh_op_evals": 658699700,
+  "prim_evals": 1003402910, "node_evals": 2003378841,
+  "cells": 284813, "corners": 468403, "crossings": 183510, "vertices": 183512, "triangles": 367020, "analytic_hits": 0,
+  "pool_entries": 238030524, "pool_bytes": 2856366288, "peak_rss_mb": 5910.0,
+  "levels": [
+    {"depth": 0, "cells": 1, "far": 0, "tested": 1, "avg_tree": 9999.0000, "max_tree": 9999, "single_prim": 0, "seconds": 0.000000},
+    {"depth": 1, "cells": 8, "far": 0, "tested": 8, "avg_tree": 9999.0000, "max_tree": 9999, "single_prim": 0, "seconds": 0.002064},
+    {"depth": 2, "cells": 64, "far": 0, "tested": 64, "avg_tree": 9942.7812, "max_tree": 9997, "single_prim": 0, "seconds": 0.014219},
+    {"depth": 3, "cells": 312, "far": 0, "tested": 512, "avg_tree": 8446.6795, "max_tree": 9857, "single_prim": 0, "seconds": 0.035678},
+    {"depth": 4, "cells": 1100, "far": 0, "tested": 2496, "avg_tree": 4536.1491, "max_tree": 6085, "single_prim": 0, "seconds": 0.051329},
+    {"depth": 5, "cells": 4491, "far": 0, "tested": 8800, "avg_tree": 2024.2501, "max_tree": 3459, "single_prim": 0, "seconds": 0.076545},
+    {"depth": 6, "cells": 17794, "far": 0, "tested": 35928, "avg_tree": 1055.9943, "max_tree": 2117, "single_prim": 0, "seconds": 0.134614},
+    {"depth": 7, "cells": 71349, "far": 0, "tested": 142352, "avg_tree": 689.2907, "max_tree": 1453, "single_prim": 0, "seconds": 0.317076},
+    {"depth": 8, "cells": 284813, "far": 0, "tested": 570792, "avg_tree": 535.8519, "max_tree": 1199, "single_prim": 0, "seconds": 1.088675}
+  ]
+}

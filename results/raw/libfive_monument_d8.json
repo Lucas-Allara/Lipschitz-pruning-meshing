@@ -1,0 +1,7 @@
+{
+ "tag": "libfive_monument_d8",
+ "scene_name": "monument",
+ "method": "libfive",
+ "failed": "CalledProcessError",
+ "wall_seconds": 40.19563522499993
+}

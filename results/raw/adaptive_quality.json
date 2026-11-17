@@ -1,0 +1,56 @@
+{
+ "trees|single_d8": {
+  "hausdorff": 0.000374858563588255,
+  "mean": 1.0100559197707108e-06,
+  "boundary": 0,
+  "nonmanifold": 0
+ },
+ "trees|all_d8": {
+  "hausdorff": 0.0015055106254646506,
+  "mean": 9.05171732885036e-06,
+  "boundary": 0,
+  "nonmanifold": 0
+ },
+ "trees|all_tol0.1_d8": {
+  "hausdorff": 0.0024030028738140485,
+  "mean": 2.3306196859349612e-05,
+  "boundary": 0,
+  "nonmanifold": 0
+ },
+ "monument|single_d8": {
+  "hausdorff": 0.00022531469362070913,
+  "mean": 1.8938739148395614e-08,
+  "boundary": 0,
+  "nonmanifold": 19
+ },
+ "monument|all_d8": {
+  "hausdorff": 0.009906380966530959,
+  "mean": 3.374840946482882e-06,
+  "boundary": 0,
+  "nonmanifold": 19
+ },
+ "monument|all_tol0.1_d8": {
+  "hausdorff": 0.009906380966530959,
+  "mean": 2.556423513626773e-05,
+  "boundary": 0,
+  "nonmanifold": 19
+ },
+ "molecule|single_d8": {
+  "hausdorff": 1.848583024339581e-06,
+  "mean": 1.1664495710843096e-11,
+  "boundary": 0,
+  "nonmanifold": 3
+ },
+ "molecule|all_d8": {
+  "hausdorff": 0.0012947567659488735,
+  "mean": 2.5717497896460035e-07,
+  "boundary": 0,
+  "nonmanifold": 3
+ },
+ "molecule|all_tol0.1_d8": {
+  "hausdorff": 0.0034746931586414364,
+  "mean": 0.00010496043990196845,
+  "boundary": 0,
+  "nonmanifold": 3
+ }
+}

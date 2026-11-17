@@ -1,0 +1,7 @@
+{
+ "tag": "libfive_spheres_n10000_k0_d8",
+ "scene_name": "spheres_n10000_k0",
+ "method": "libfive",
+ "failed": "CalledProcessError",
+ "wall_seconds": 54.44337372500013
+}

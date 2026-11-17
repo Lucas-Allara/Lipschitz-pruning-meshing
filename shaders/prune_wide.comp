@@ -1,0 +1,163 @@
+// The same pruning as prune.comp for the children of parents with large trees (more than pc.wide
+// entries), where one invocation per child would walk thousands of nodes alone: here one
+// workgroup takes one child, its invocations evaluate the primitives of the tree in parallel, and
+// the first invocation combines the operators and compacts the tree, which is cheap by comparison.
+// Compiled with -DINTERVAL, with the interval test of prune.comp.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const int STACK = 16;
+
+#include "prune_common.glsl"
+
+void main() {
+    const uint tid = gl_WorkGroupID.x;  // child index, as gl_GlobalInvocationID.x in prune.comp
+    const uint lane = gl_LocalInvocationID.x;
+    if (tid >= 8u * pc.n_parents) return;
+    const Cell parent = in_cells[tid >> 3];
+    const uint n = parent.tree.y;
+    if (n <= pc.wide || parent.xyz.w == COARSE_LEAF) return;  // uniform in the workgroup
+    const uint child = tid & 7u, off = parent.tree.x;
+    const uvec3 cc = child_cell(parent.xyz.xyz, child);
+    const uint sbase = 8u * off + child * n;
+#ifdef INTERVAL
+    dvec2 bx, by, bz;
+    child_box(cc, bx, by, bz);
+#else
+    const dvec3 center = child_center(cc);
+#endif
+
+    // Primitives, in parallel.
+    uint prim_evals = 0u;
+    for (uint i = lane; i < n; i += gl_WorkGroupSize.x) {
+        const uvec2 nd = nodes[in_pool[3u * (off + i)]];
+        if (nd.x == NODE_PRIM) {
+#ifdef INTERVAL
+            values[sbase + i] = inflate(eval_primitive_iv(nd.y, bx, by, bz));
+#else
+            values[sbase + i] = eval_primitive(nd.y, center);
+#endif
+            prim_evals++;
+        }
+    }
+    if (prim_evals > 0u) atomicAdd(counters.prim_evals, uint64_t(prim_evals));
+    memoryBarrierBuffer();
+    barrier();
+    if (lane != 0u) return;
+
+    // Procedure 1 with the values of the primitives already known.
+#ifdef INTERVAL
+    dvec2 st[STACK];
+    uint si[STACK];
+    int sp = 0;
+    uint op_evals = 0u;
+    for (uint i = 0u; i < n; i++) {
+        const uint e = 3u * (off + i);
+        const uvec2 nd = nodes[in_pool[e]];
+        dvec2 d;
+        uint state = ACTIVE;
+        if (nd.x == NODE_PRIM) {
+            d = values[sbase + i];
+        } else {
+            sp--; const dvec2 B = st[sp]; const uint ri = si[sp];
+            sp--; const dvec2 A = st[sp]; const uint li = si[sp];
+            const dvec4 op = ops[nd.y];
+            d = eval_op_iv(op, A, B);
+            op_evals++;
+            const bool a_below = A.y + op.x <= B.x, b_below = B.y + op.x <= A.x;
+            if (a_below || b_below) {
+                state = SKIPPED;
+                if (op.y > 0.0 ? a_below : b_below) scratch[sbase + ri].x = INACTIVE;
+                else scratch[sbase + li].x = INACTIVE;
+            }
+        }
+        scratch[sbase + i].x = state;
+        st[sp] = (in_pool[e + 2u] & 0xffu) == 0xffu ? iv_neg(d) : d;
+        si[sp] = i;
+        sp++;
+    }
+    atomicAdd(counters.op_evals, uint64_t(op_evals));
+    const bool keep = st[0].x <= 0.0 && 0.0 <= st[0].y;
+#else
+    double st[STACK];
+    uint si[STACK];
+    int sp = 0;
+    uint op_evals = 0u;
+    for (uint i = 0u; i < n; i++) {
+        const uint e = 3u * (off + i);
+        const uvec2 nd = nodes[in_pool[e]];
+        double d;
+        uint state = ACTIVE;
+        if (nd.x == NODE_PRIM) {
+            d = values[sbase + i];
+        } else {
+            sp--; const double b = st[sp]; const uint ri = si[sp];
+            sp--; const double a = st[sp]; const uint li = si[sp];
+            const dvec4 op = ops[nd.y];
+            d = eval_op(op, a, b);
+            op_evals++;
+            if (abs(a - b) > op.x + 2.0 * pc.r_prune) {
+                state = SKIPPED;
+                if (op.y * a < op.y * b) scratch[sbase + ri].x = INACTIVE;
+                else scratch[sbase + li].x = INACTIVE;
+            }
+        }
+        scratch[sbase + i].x = state;
+        st[sp] = (in_pool[e + 2u] & 0xffu) == 0xffu ? -d : d;
+        si[sp] = i;
+        sp++;
+    }
+    atomicAdd(counters.op_evals, uint64_t(op_evals));
+    const bool keep = abs(st[0]) <= pc.r_keep;
+#endif
+    if (!keep && pc.keep_empty == 0u) return;
+
+    // Procedure 2 and compaction, as in prune.comp.
+    uint count = 0u;
+    for (int i = int(n) - 1; i >= 0; i--) {
+        const uint state = scratch[sbase + i].x & STATE_MASK;
+        if (state == INACTIVE) {
+            scratch[sbase + i] = uvec2(INACTIVE | INACTIVE_ANC, NO_PARENT);
+            continue;
+        }
+        const uint e = 3u * (off + uint(i));
+        const uint pi = in_pool[e + 1u];
+        bool negative = (in_pool[e + 2u] & 0xffu) == 0xffu;
+        uint np = pi;
+        bool inactive_anc = false;
+        if (pi != NO_PARENT) {
+            const uvec2 ps = scratch[sbase + pi];
+            inactive_anc = (ps.x & INACTIVE_ANC) != 0u;
+            if ((ps.x & STATE_MASK) == SKIPPED) {
+                negative = negative != ((ps.x & NEGATIVE) != 0u);
+                np = ps.y;
+            }
+        }
+        const bool active_global = state == ACTIVE && !inactive_anc;
+        scratch[sbase + i] = uvec2(state | (inactive_anc ? INACTIVE_ANC : 0u) |
+                                   (active_global ? ACTIVE_GLOBAL : 0u) | (negative ? NEGATIVE : 0u), np);
+        if (active_global) count++;
+    }
+    const uint base = atomicAdd(counters.entries, count);
+    if (keep) {
+        const uint cell_out = atomicAdd(counters.cells, 1u);
+        atomicMax(counters.max_tree, count);
+        if (count == 1u) atomicAdd(counters.single_prim, 1u);
+        out_cells[cell_out] = Cell(uvec4(cc, 0u), uvec4(base, count, 0u, 0u));
+    } else {
+        out_far[atomicAdd(counters.far_cells, 1u)] = Cell(uvec4(cc, 1u), uvec4(base, count, 0u, 0u));
+    }
+    uint out_index = count;
+    for (int i = int(n) - 1; i >= 0; i--) {
+        const uvec2 s = scratch[sbase + i];
+        if ((s.x & ACTIVE_GLOBAL) == 0u) continue;
+        out_index--;
+        const uint parent_out = s.y != NO_PARENT ? scratch[sbase + s.y].y : NO_PARENT;
+        scratch[sbase + i].y = out_index;
+        const uint o = 3u * (base + out_index);
+        out_pool[o] = in_pool[3u * (off + uint(i))];
+        out_pool[o + 1u] = parent_out;
+        out_pool[o + 2u] = (s.x & NEGATIVE) != 0u ? 0xffu : 1u;
+    }
+}

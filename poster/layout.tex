@@ -1,0 +1,74 @@
+% Layout of the poster: a burgundy band with the title and the UTDT logo, the three meshes,
+% introduction and contribution on the left, results on the right, and limitations, conclusions
+% and references at the bottom. All text comes from content.tex.
+\newcommand{\heading}[1]{%
+  {\boldfont\fontsize{38}{42}\selectfont\color{burgundy}\stripes{9.5}{burgundy}\hspace{5mm}#1\par}
+  \vspace{2.5mm}{\color{burgundy}\rule{\linewidth}{0.7mm}}\par\vspace{6mm}}
+
+\begin{document}
+\begin{tikzpicture}[remember picture, overlay]
+
+% ---------------------------------------------------------------- header
+\fill[burgundy] (current page.north west) rectangle ($(current page.north east) + (0, -125mm)$);
+\placeblock{25}{16}{455}{\color{white}%
+  {\heavyfont\fontsize{80}{86}\selectfont \TitleLines\par}
+  \vspace{6mm}
+  {\fontsize{24}{30}\selectfont\color{white!85!burgundy}\Subtitle\par}}
+\node[anchor=north east, inner sep=0pt] at ($(current page.north east) + (-25mm, -24mm)$)
+  {\includegraphics[width=165mm]{utdt_logo_white.pdf}};
+\node[anchor=north east, inner sep=0pt, text width=165mm]
+  at ($(current page.north east) + (-25mm, -54mm)$) {\resetspaces\raggedleft\color{white}
+  {\fontsize{22}{28}\selectfont\color{white!85!burgundy}\Course\par}
+  \vspace{9mm}
+  {\boldfont\fontsize{34}{40}\selectfont Lucas Allara\par}
+  \vspace{2mm}
+  {\fontsize{22}{28}\selectfont\color{white!85!burgundy}\Date\par}};
+
+% ---------------------------------------------------------------- meshes
+\placeblock{57.5}{140}{585}{%
+  \Teaser{585}
+  \vspace{4mm}
+  {\captiontext\makebox[585mm][c]{\Scale{110}}\par}}
+
+% ---------------------------------------------------------------- introduction and contribution
+\placeblock{25}{347}{305}{%
+  \heading{\SecIntro}
+  {\bodytext\IntroText}
+  \vspace{6mm}
+  \heading{\SecContribution}
+  {\bodytext\ContributionText}}
+
+% ---------------------------------------------------------------- results
+\placeblock{360}{347}{315}{%
+  \heading{\SecResults}
+  \bignumber{98mm}{burgundy}{\NumA}{\NumAText}\hfill
+  \bignumber{98mm}{burgundy}{\NumB}{\NumBText}\hfill
+  \bignumber{98mm}{burgundy}{\NumC}{\NumCText}\par
+  \vspace{7mm}
+  \FigTimes{315}
+  \vspace{7mm}
+  \begin{minipage}[t]{150mm}\vspace{0pt}\resetspaces\raggedright\FigDynamic{150}\end{minipage}\hfill
+  \begin{minipage}[t]{158mm}\vspace{0pt}\resetspaces\raggedright\FigCoarseDetail\end{minipage}\par
+  \vspace{7mm}
+  \begin{minipage}[t]{112mm}\vspace{0pt}\resetspaces\raggedright\FigScaling{112}\end{minipage}\hfill
+  \begin{minipage}[t]{196mm}\vspace{0pt}\resetspaces\raggedright\FigCoarse{196}\par\vspace{6mm}\ResultsTable\end{minipage}}
+
+% ---------------------------------------------------------------- limitations, conclusions and references
+\placeblock{25}{788}{195}{%
+  \heading{\SecLimitations}
+  {\smalltext\LimitationsText}}
+\placeblock{242}{788}{222}{%
+  \heading{\SecConclusions}
+  {\smalltext\ConclusionsText}}
+\placeblock{486}{788}{189}{%
+  \heading{\SecReferences}
+  {\tinytext\ReferencesText
+   \vspace{3mm}
+   \begin{minipage}[b]{150mm}\resetspaces\raggedright\Credits\end{minipage}\hfill
+   \QR{30mm}\par}}
+
+% ---------------------------------------------------------------- footer
+\fill[burgundy] ($(current page.south west) + (0, 7mm)$) rectangle (current page.south east);
+
+\end{tikzpicture}
+\end{document}

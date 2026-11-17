@@ -1,0 +1,48 @@
+// Exclusive prefix sum of n values in blocks of 1024 (256 invocations, 4 values each). The values
+// are either the input words or, with mode 1, their bit counts. Each block writes its exclusive
+// sums to out and its total to sums; the host scans the block totals recursively and adds them
+// back with scan_add.comp. Element n is taken as 0, so out[n] ends up holding the total.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+
+layout(push_constant) uniform PC {
+    U32 data;   // input
+    U32 out_;   // n + 1 exclusive sums
+    U32 sums;   // one total per block
+    uint n;
+    uint mode;  // 0: values, 1: bit counts of the words
+} pc;
+
+shared uint partial[256];
+
+void main() {
+    const uint t = gl_LocalInvocationID.x;
+    const uint base = gl_WorkGroupID.x * 1024u + 4u * t;
+    uint local[4];
+    uint sum = 0u;
+    for (uint k = 0u; k < 4u; k++) {
+        const uint i = base + k;
+        uint x = 0u;
+        if (i < pc.n) x = pc.mode == 1u ? bitCount(pc.data.v[i]) : pc.data.v[i];
+        local[k] = sum;
+        sum += x;
+    }
+    partial[t] = sum;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1) {
+        const uint y = t >= off ? partial[t - off] : 0u;
+        barrier();
+        partial[t] += y;
+        barrier();
+    }
+    const uint before = t > 0u ? partial[t - 1u] : 0u;
+    for (uint k = 0u; k < 4u; k++) {
+        const uint i = base + k;
+        if (i <= pc.n) pc.out_.v[i] = before + local[k];
+    }
+    if (t == 255u) pc.sums.v[gl_WorkGroupID.x] = partial[255];
+}

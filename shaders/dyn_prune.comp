@@ -1,0 +1,573 @@
+// One level of the dynamic descent of build_dynamic (include/lpm/dynamic.h) on the GPU: the scene
+// is the static scene T joined by a smooth union with a moving sphere S. Every invocation takes a
+// child of a dynamic cell (one where the sphere was still active) and prunes, for the ball of the
+// child, the smaller of two exact inputs: the dynamic tree of the parent, or the static tree of
+// the child joined with the sphere under the union root. Then:
+//   |f(center)| > R: culled; when the static octree has a cell with surface there, the sphere
+//   swallowed it, and the cell is recorded so that the patch drops its static leaves;
+//   the sphere is pruned away: T wins on the whole ball, the static result stands;
+//   otherwise the child is a dynamic cell of the next level, with its pruned tree.
+// When the child has a static tree that pruning leaves unchanged at its center (a fixed point,
+// checked once by the VALUE variant), only the union root is new: its value comes from the stored
+// value of the static tree and the sphere, one primitive instead of the whole tree.
+// Compiled three times: one invocation per child; with -DWIDE one workgroup per child for inputs
+// larger than p.wide (its invocations evaluate the primitives in parallel); with -DVALUE one
+// invocation per static cell, for the stored values.
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_atomic_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+#if defined(WIDE)
+layout(local_size_x = 128) in;
+#else
+layout(local_size_x = 64) in;
+#endif
+layout(constant_id = 0) const int STACK = 16;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer F64 { double v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer DynCounters {
+    uint cells, entries, culled, max_tree;
+    uint64_t prim_evals, op_evals;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 32) readonly buffer Level {
+    dvec4 aabb_min;
+    dvec4 size;          // size of a child cell
+    double r_keep;       // the child is kept when |f(center)| <= r_keep
+    double r_prune;      // radius of the ball the tree is pruned for
+    uint level;          // level of the children
+    uint sphere_node, root_node;
+    uint wide;           // inputs larger than this are pruned by the WIDE variant
+    uint culled_cap;     // capacity of culled
+    uint cell_cap;       // capacity of out_cells, in cells
+    uint entry_cap;      // capacity of out_pool, in entries
+    uint pad0;
+    U32 nodes;           // 2 per node: type, index
+    F64 prims;           // 24 per primitive
+    F64 ops;             // 4 per operator: k, s, 0.25 / k
+    U32 parents;         // dynamic cells of the parent level, 8 uints each
+    U32 parent_pool;     // their trees, 3 uints per entry (TreeEntry)
+    U32 out_cells;
+    U32 out_pool;
+    U32 scratch;         // 2 per input entry: flags, new parent then output index
+    F64 values;          // WIDE: values of the primitives
+    U32 st_grid;         // static grid of the level: cell + 1, far cell + 1 with bit 31, or 0
+    U32 st_cells;        // static cells and far cells of the level, 8 uints each
+    U32 st_far;
+    U32 st_pool;         // their trees
+    U32 culled;          // swallowed cells: x, y, z, level
+    DynCounters counters;
+    F64 st_value;        // value of the tree of each static cell at its center; NaN if not a fixed point
+    F64 st_far_value;
+    U32 args;            // of this level (shaders/dyn_args.comp): v[6] is the number of parents
+    U32 culled_count;    // swallowed cells recorded by all the levels of the frame
+};
+
+layout(push_constant) uniform PC {
+    Level p;
+    uint n_parents;  // VALUE: number of cells (the descent reads it from P.args)
+    uint far;        // VALUE: the far cells instead of the cells with surface
+} pc;
+
+#define P (pc.p)
+#define PRIM_VALUE(i) P.prims.v[i]
+#include "sdf.glsl"
+
+const uint NODE_PRIM = 1u;
+const uint INACTIVE = 0u, SKIPPED = 1u, ACTIVE = 2u;
+const uint STATE_MASK = 3u, INACTIVE_ANC = 4u, ACTIVE_GLOBAL = 8u, NEGATIVE = 16u;
+const uint NONE = 0xffffffffu;
+
+// The input tree of a child: mode 0, the dynamic tree of the parent; mode 1, the static tree of
+// the child (n - 2 entries) followed by the sphere and the union root, as detail::combine.
+struct Input { uint mode, off, n; };
+
+// node, parent, negative sign
+uvec3 entry(Input in_, uint i) {
+    if (in_.mode == 0u) {
+        const uint e = 3u * (in_.off + i);
+        return uvec3(P.parent_pool.v[e], P.parent_pool.v[e + 1u], (P.parent_pool.v[e + 2u] & 0xffu) == 0xffu ? 1u : 0u);
+    }
+    const uint ns = in_.n - 2u;
+    if (i < ns) {
+        const uint e = 3u * (in_.off + i);
+        const uint par = P.st_pool.v[e + 1u];
+        return uvec3(P.st_pool.v[e], par == NONE ? ns + 1u : par, (P.st_pool.v[e + 2u] & 0xffu) == 0xffu ? 1u : 0u);
+    }
+    if (i == ns) return uvec3(P.sphere_node, ns + 1u, 0u);
+    return uvec3(P.root_node, NONE, 0u);
+}
+
+struct Child { uvec3 cc; dvec3 center; Input in_; uint sbase; bool static_surface, fast; double tval; };
+
+dvec3 cell_center(uvec3 cc) { return P.aabb_min.xyz + (dvec3(cc) + 0.5) * P.size.xyz; }
+
+Child make_child(uint tid) {
+    Child c;
+    const uint pid = tid >> 3, child = tid & 7u;
+    const uvec3 pxyz = uvec3(P.parents.v[8u * pid], P.parents.v[8u * pid + 1u], P.parents.v[8u * pid + 2u]);
+    const uint poff = P.parents.v[8u * pid + 4u], pn = P.parents.v[8u * pid + 5u];
+    c.cc = 2u * pxyz + uvec3(child & 1u, (child >> 1) & 1u, (child >> 2) & 1u);
+    c.center = cell_center(c.cc);
+    c.in_ = Input(0u, poff, pn);
+    c.fast = false;
+    c.tval = 0.0;
+    const uint nl = 1u << P.level;
+    const uint g = P.st_grid.v[(c.cc.x * nl + c.cc.y) * nl + c.cc.z];
+    c.static_surface = g != 0u && (g & 0x80000000u) == 0u;
+    if (g != 0u) {
+        const uint id = (g & 0x7fffffffu) - 1u;
+        U32 cells = (g & 0x80000000u) != 0u ? P.st_far : P.st_cells;
+        const uint ns = cells.v[8u * id + 5u];
+        if (ns + 2u <= pn) {
+            c.in_ = Input(1u, cells.v[8u * id + 4u], ns + 2u);
+            c.tval = (g & 0x80000000u) != 0u ? P.st_far_value.v[id] : P.st_value.v[id];
+            c.fast = !isnan(c.tval);
+        }
+    }
+    c.sbase = 8u * poff + child * pn;  // the input is never larger than the tree of the parent
+    return c;
+}
+
+uint prim_evals = 0u, op_evals = 0u;
+
+// Procedure 1 at the center; prims holds the values of the primitives when they are precomputed.
+double local_state(Child c, bool precomputed) {
+    double st[STACK];
+    uint si[STACK];
+    int sp = 0;
+    for (uint i = 0u; i < c.in_.n; i++) {
+        const uvec3 e = entry(c.in_, i);
+        const uint type = P.nodes.v[2u * e.x], idx = P.nodes.v[2u * e.x + 1u];
+        double d;
+        uint state = ACTIVE;
+        if (type == NODE_PRIM) {
+            if (precomputed) d = P.values.v[c.sbase + i];
+            else { d = eval_primitive(idx, c.center); prim_evals++; }
+        } else {
+            sp--; const double b = st[sp]; const uint ri = si[sp];
+            sp--; const double a = st[sp]; const uint li = si[sp];
+            const dvec4 op = dvec4(P.ops.v[4u * idx], P.ops.v[4u * idx + 1u], P.ops.v[4u * idx + 2u], 0.0);
+            d = eval_op(op, a, b);
+            op_evals++;
+            if (abs(a - b) > op.x + 2.0 * P.r_prune) {
+                state = SKIPPED;
+                if (op.y * a < op.y * b) P.scratch.v[2u * (c.sbase + ri)] = INACTIVE;
+                else P.scratch.v[2u * (c.sbase + li)] = INACTIVE;
+            }
+        }
+        P.scratch.v[2u * (c.sbase + i)] = state;
+        st[sp] = e.z != 0u ? -d : d;
+        si[sp] = i;
+        sp++;
+    }
+    return st[0];
+}
+
+// Procedure 2: returns the size of the pruned tree and whether the sphere survives.
+uint global_state(Child c, out bool sphere) {
+    uint count = 0u;
+    sphere = false;
+    for (int i = int(c.in_.n) - 1; i >= 0; i--) {
+        const uint s = c.sbase + uint(i);
+        const uint state = P.scratch.v[2u * s] & STATE_MASK;
+        if (state == INACTIVE) {
+            P.scratch.v[2u * s] = INACTIVE | INACTIVE_ANC;
+            P.scratch.v[2u * s + 1u] = NONE;
+            continue;
+        }
+        const uvec3 e = entry(c.in_, uint(i));
+        bool negative = e.z != 0u;
+        uint np = e.y;
+        bool inactive_anc = false;
+        if (e.y != NONE) {
+            const uint pf = P.scratch.v[2u * (c.sbase + e.y)];
+            inactive_anc = (pf & INACTIVE_ANC) != 0u;
+            if ((pf & STATE_MASK) == SKIPPED) {
+                negative = negative != ((pf & NEGATIVE) != 0u);
+                np = P.scratch.v[2u * (c.sbase + e.y) + 1u];
+            }
+        }
+        const bool active_global = state == ACTIVE && !inactive_anc;
+        P.scratch.v[2u * s] = state | (inactive_anc ? INACTIVE_ANC : 0u) | (active_global ? ACTIVE_GLOBAL : 0u) | (negative ? NEGATIVE : 0u);
+        P.scratch.v[2u * s + 1u] = np;
+        if (active_global) {
+            count++;
+            if (e.x == P.sphere_node) sphere = true;
+        }
+    }
+    return count;
+}
+
+void write_tree(Child c, uint base, uint count) {
+    uint out_index = count;
+    for (int i = int(c.in_.n) - 1; i >= 0; i--) {
+        const uint s = c.sbase + uint(i);
+        const uint flags = P.scratch.v[2u * s];
+        if ((flags & ACTIVE_GLOBAL) == 0u) continue;
+        out_index--;
+        const uint np = P.scratch.v[2u * s + 1u];
+        const uint parent_out = np != NONE ? P.scratch.v[2u * (c.sbase + np) + 1u] : NONE;
+        P.scratch.v[2u * s + 1u] = out_index;
+        const uint o = 3u * (base + out_index);
+        P.out_pool.v[o] = entry(c.in_, uint(i)).x;
+        P.out_pool.v[o + 1u] = parent_out;
+        P.out_pool.v[o + 2u] = (flags & NEGATIVE) != 0u ? 0xffu : 1u;
+    }
+}
+
+// The union root of a fixed-point input: 0 culled, 1 the sphere is pruned away (T wins), 2 dynamic
+// with the whole input, 3 dynamic with the sphere alone (T is pruned away).
+uint fast_state(Child c) {
+    const double a = c.tval;
+    const double b = eval_primitive(P.nodes.v[2u * P.sphere_node + 1u], c.center);
+    prim_evals++;
+    const uint idx = P.nodes.v[2u * P.root_node + 1u];
+    const dvec4 op = dvec4(P.ops.v[4u * idx], P.ops.v[4u * idx + 1u], P.ops.v[4u * idx + 2u], 0.0);
+    const double d = eval_op(op, a, b);
+    op_evals++;
+    if (!(abs(d) <= P.r_keep)) return 0u;
+    if (abs(a - b) > op.x + 2.0 * P.r_prune) return op.y * a < op.y * b ? 1u : 3u;
+    return 2u;
+}
+
+// Output entry k of a fixed-point input: the input as it is, or the sphere alone.
+void write_fast(Child c, uint base, uint state, uint k) {
+    const uint o = 3u * (base + k);
+    if (state == 3u) {
+        P.out_pool.v[o] = P.sphere_node; P.out_pool.v[o + 1u] = NONE; P.out_pool.v[o + 2u] = 1u;
+        return;
+    }
+    const uvec3 e = entry(c.in_, k);
+    P.out_pool.v[o] = e.x; P.out_pool.v[o + 1u] = e.y; P.out_pool.v[o + 2u] = e.z != 0u ? 0xffu : 1u;
+}
+
+void write_cell(uint k, uvec3 cc, uint base, uint count) {
+    P.out_cells.v[8u * k] = cc.x; P.out_cells.v[8u * k + 1u] = cc.y; P.out_cells.v[8u * k + 2u] = cc.z;
+    P.out_cells.v[8u * k + 3u] = 0u; P.out_cells.v[8u * k + 4u] = base; P.out_cells.v[8u * k + 5u] = count;
+}
+
+void record_culled(uvec3 cc) {
+    const uint k = atomicAdd(P.culled_count.v[0], 1u);
+    if (k < P.culled_cap) {
+        P.culled.v[4u * k] = cc.x; P.culled.v[4u * k + 1u] = cc.y; P.culled.v[4u * k + 2u] = cc.z;
+        P.culled.v[4u * k + 3u] = P.level;
+    }
+}
+
+#if defined(VALUE)
+// The value of the tree of a static cell at its center, and whether pruning keeps every operator
+// there; NaN when it does not, and the descent prunes the input in full.
+void main() {
+    const uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.n_parents) return;
+    U32 cells = pc.far != 0u ? P.st_far : P.st_cells;
+    const uvec3 cc = uvec3(cells.v[8u * k], cells.v[8u * k + 1u], cells.v[8u * k + 2u]);
+    const uint off = cells.v[8u * k + 4u], n = cells.v[8u * k + 5u];
+    const dvec3 center = cell_center(cc);
+    double st[STACK];
+    int sp = 0;
+    bool fixed_point = true;
+    for (uint i = 0u; i < n; i++) {
+        const uint e = 3u * (off + i);
+        const uint node = P.st_pool.v[e];
+        const uint type = P.nodes.v[2u * node], idx = P.nodes.v[2u * node + 1u];
+        double d;
+        if (type == NODE_PRIM) d = eval_primitive(idx, center);
+        else {
+            sp--; const double b = st[sp];
+            sp--; const double a = st[sp];
+            const dvec4 op = dvec4(P.ops.v[4u * idx], P.ops.v[4u * idx + 1u], P.ops.v[4u * idx + 2u], 0.0);
+            d = eval_op(op, a, b);
+            if (abs(a - b) > op.x + 2.0 * P.r_prune) fixed_point = false;
+        }
+        st[sp] = (P.st_pool.v[e + 2u] & 0xffu) == 0xffu ? -d : d;
+        sp++;
+    }
+    F64 out_ = pc.far != 0u ? P.st_far_value : P.st_value;
+    out_.v[k] = fixed_point && n > 0u ? st[0] : uintBitsToFloat(0x7fc00000u);
+}
+#elif defined(WIDE)
+shared uint s_base;
+
+// The full pruning of an input that fits in shared memory, by the whole workgroup. Procedure 1 and
+// Procedure 2 walk the tree one node after another, and at depth 9 a thousand nodes took most of a
+// millisecond (each step waits for the double precision arithmetic of the one before). Here they
+// run in rounds instead: in Procedure 1 an operator is evaluated once both children are, bottom
+// up, and in Procedure 2 a node once its parent is, top down, so that a round per level of the
+// tree replaces a step per node; the output indices are a prefix sum. Every node does the
+// arithmetic of local_state, global_state and write_tree, so the pruned tree is the same.
+const uint CAP = 1024u;
+const uint S_NEG = 0x80000000u, S_OPNEG = 0x40000000u, S_PRIM = 0x20000000u, S_NODE = 0x1fffffffu;
+shared uint s_node[CAP];    // node, with its sign, the sign s of its operator and whether it is a primitive
+shared uint s_par[CAP];     // parent in the input, then index in the output
+shared uint s_flags[CAP];   // flags, and in bits 16 on the round in which the node was done, + 1
+shared uint s_link[CAP];    // left child (Procedure 1), then new parent (Procedure 2)
+shared double s_val[CAP];   // value pushed for the parent (signed); before, the radius k of an operator
+shared double s_z[CAP];     // 0.25 / k of an operator
+shared uint s_sub[32];
+shared uint s_left;
+// Rounds in which Procedure 1 computed the root and Procedure 2 its last node, 0 before. The loops
+// of rounds stop on them and not on the state they write during a round: every invocation reads the
+// same value after a barrier, so all of them run the same number of rounds and of barriers.
+shared uint s_end1, s_end2;
+shared uint s_any;
+
+uint done_round(uint f) { return f >> 16; }
+uint with_round(uint f, uint r) { return (f & 0xffffu) | (r << 16); }
+
+// Exclusive prefix sum over the workgroup, in invocation order, and its total.
+uint group_exclusive_sum(uint v, out uint total) {
+    const uint before = subgroupExclusiveAdd(v), sum = subgroupAdd(v);
+    if (subgroupElect()) s_sub[gl_SubgroupID] = sum;
+    barrier();
+    uint b = before;
+    total = 0u;
+    for (uint g = 0u; g < gl_NumSubgroups; g++) {
+        if (g < gl_SubgroupID) b += s_sub[g];
+        total += s_sub[g];
+    }
+    barrier();
+    return b;
+}
+
+void prune_in_shared(Child c, uint lane) {
+    const uint n = c.in_.n, wg = gl_WorkGroupSize.x;
+    for (uint i = lane; i < n; i += wg) {
+        const uvec3 e = entry(c.in_, i);
+        const uint idx = P.nodes.v[2u * e.x + 1u];
+        s_par[i] = e.y;
+        if (P.nodes.v[2u * e.x] == NODE_PRIM) {
+            const double v = eval_primitive(idx, c.center);
+            prim_evals++;
+            s_node[i] = e.x | (e.z << 31) | S_PRIM;
+            s_val[i] = e.z != 0u ? -v : v;
+            s_flags[i] = with_round(ACTIVE, 1u);
+        } else {
+            s_node[i] = e.x | (e.z << 31) | (P.ops.v[4u * idx + 1u] < 0.0 ? S_OPNEG : 0u);
+            s_val[i] = P.ops.v[4u * idx];
+            s_z[i] = P.ops.v[4u * idx + 2u];
+            s_flags[i] = 0u;
+        }
+    }
+    if (lane == 0u) { s_left = n; s_any = 0u; s_end1 = 0u; s_end2 = 0u; }
+    barrier();
+    // In postorder the right child of an operator is the entry just before it.
+    for (uint j = lane; j < n; j += wg) {
+        const uint p = s_par[j];
+        if (p != NONE && j + 1u != p) s_link[p] = j;
+    }
+    barrier();
+
+    // Procedure 1: the operators whose children were done in earlier rounds.
+    for (uint r = 1u; s_end1 == 0u || s_end1 >= r; r++) {
+        for (uint i = lane; i < n; i += wg) {
+            if ((s_node[i] & S_PRIM) != 0u || done_round(s_flags[i]) != 0u) continue;
+            const uint ri = i - 1u, li = s_link[i];
+            const uint dr = done_round(s_flags[ri]), dl = done_round(s_flags[li]);
+            if (dr == 0u || dr > r || dl == 0u || dl > r) continue;
+            const double a = s_val[li], b = s_val[ri];
+            const dvec4 op = dvec4(s_val[i], (s_node[i] & S_OPNEG) != 0u ? -1.0 : 1.0, s_z[i], 0.0);
+            const double d = eval_op(op, a, b);
+            op_evals++;
+            uint state = ACTIVE;
+            if (abs(a - b) > op.x + 2.0 * P.r_prune) {
+                state = SKIPPED;
+                const uint loser = op.y * a < op.y * b ? ri : li;
+                s_flags[loser] = (s_flags[loser] & 0xffff0000u) | INACTIVE;
+            }
+            s_val[i] = (s_node[i] & S_NEG) != 0u ? -d : d;
+            s_flags[i] = with_round(state, r + 1u);
+            if (i == n - 1u) s_end1 = r;
+        }
+        barrier();
+    }
+    const uint so = subgroupAdd(op_evals);
+    if (subgroupElect() && so > 0u) atomicAdd(P.counters.op_evals, uint64_t(so));
+    const uint sp = subgroupAdd(prim_evals);
+    if (subgroupElect() && sp > 0u) atomicAdd(P.counters.prim_evals, uint64_t(sp));
+    if (!(abs(s_val[n - 1u]) <= P.r_keep)) {  // uniform: shared, after the last barrier
+        if (lane == 0u && c.static_surface) record_culled(c.cc);
+        return;
+    }
+
+    // Procedure 2: a node once its parent was done (an inactive node waits for nothing).
+    for (uint i = lane; i < n; i += wg) s_flags[i] &= 0xffffu;
+    barrier();
+    for (uint r = 1u; s_end2 == 0u || s_end2 >= r; r++) {
+        for (uint i = lane; i < n; i += wg) {
+            if (done_round(s_flags[i]) != 0u) continue;
+            const uint state = s_flags[i] & STATE_MASK;
+            if (state == INACTIVE) {
+                s_flags[i] = with_round(INACTIVE | INACTIVE_ANC, r + 1u);
+                s_link[i] = NONE;
+                if (atomicAdd(s_left, 0xffffffffu) == 1u) s_end2 = r;
+                continue;
+            }
+            const uint parent = s_par[i];
+            uint pf = 0u;
+            if (parent != NONE) {
+                pf = s_flags[parent];
+                const uint dp = done_round(pf);
+                if (dp == 0u || dp > r) continue;
+            }
+            bool negative = (s_node[i] & S_NEG) != 0u;
+            uint np = parent;
+            bool inactive_anc = false;
+            if (parent != NONE) {
+                inactive_anc = (pf & INACTIVE_ANC) != 0u;
+                if ((pf & STATE_MASK) == SKIPPED) {
+                    negative = negative != ((pf & NEGATIVE) != 0u);
+                    np = s_link[parent];
+                }
+            }
+            const bool active_global = state == ACTIVE && !inactive_anc;
+            s_flags[i] = with_round(state | (inactive_anc ? INACTIVE_ANC : 0u) | (active_global ? ACTIVE_GLOBAL : 0u) |
+                                        (negative ? NEGATIVE : 0u), r + 1u);
+            s_link[i] = np;
+            if (atomicAdd(s_left, 0xffffffffu) == 1u) s_end2 = r;
+        }
+        barrier();
+    }
+
+    // The surviving entries, numbered in postorder by a prefix sum over contiguous ranges.
+    const uint chunk = (n + wg - 1u) / wg, i0 = min(lane * chunk, n), i1 = min(i0 + chunk, n);
+    uint mine = 0u;
+    bool sphere = false;
+    for (uint i = i0; i < i1; i++) {
+        if ((s_flags[i] & ACTIVE_GLOBAL) == 0u) continue;
+        mine++;
+        if ((s_node[i] & S_NODE) == P.sphere_node) sphere = true;
+    }
+    if (sphere) s_any = 1u;
+    uint count;
+    uint o = group_exclusive_sum(mine, count);
+    if (s_any == 0u) return;  // uniform: the sphere is pruned away
+    for (uint i = i0; i < i1; i++) if ((s_flags[i] & ACTIVE_GLOBAL) != 0u) s_par[i] = o++;
+    if (lane == 0u) {
+        s_base = atomicAdd(P.counters.entries, count);
+        const uint k = atomicAdd(P.counters.cells, 1u);
+        atomicMax(P.counters.max_tree, count);
+        if (k >= P.cell_cap || s_base + count > P.entry_cap) s_base = NONE;
+        else write_cell(k, c.cc, s_base, count);
+    }
+    barrier();
+    const uint base = s_base;
+    if (base == NONE) return;
+    for (uint i = lane; i < n; i += wg) {
+        const uint flags = s_flags[i];
+        if ((flags & ACTIVE_GLOBAL) == 0u) continue;
+        const uint np = s_link[i];
+        const uint o3 = 3u * (base + s_par[i]);
+        P.out_pool.v[o3] = s_node[i] & S_NODE;
+        P.out_pool.v[o3 + 1u] = np != NONE ? s_par[np] : NONE;
+        P.out_pool.v[o3 + 2u] = (flags & NEGATIVE) != 0u ? 0xffu : 1u;
+    }
+}
+
+void main() {
+    const uint tid = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+    if (tid >= 8u * P.args.v[6]) return;
+    const Child c = make_child(tid);
+    if (c.in_.n <= P.wide) return;  // uniform in the workgroup
+    if (c.fast) {
+        // Every invocation finds the same state; the first reserves the space, all of them copy.
+        const uint state = fast_state(c);
+        if (state == 0u) { if (lane == 0u && c.static_surface) record_culled(c.cc); return; }
+        if (state == 1u) return;
+        const uint count = state == 2u ? c.in_.n : 1u;
+        if (lane == 0u) {
+            s_base = atomicAdd(P.counters.entries, count);
+            const uint k = atomicAdd(P.counters.cells, 1u);
+            atomicMax(P.counters.max_tree, count);
+            atomicAdd(P.counters.prim_evals, uint64_t(1));
+            atomicAdd(P.counters.op_evals, uint64_t(1));
+            // Past the capacity the counters still grow, which tells the host to grow the buffers.
+            if (k >= P.cell_cap || s_base + count > P.entry_cap) s_base = NONE;
+            else write_cell(k, c.cc, s_base, count);
+        }
+        barrier();
+        const uint base = s_base;
+        if (base == NONE) return;
+        for (uint i = lane; i < count; i += gl_WorkGroupSize.x) write_fast(c, base, state, i);
+        return;
+    }
+    if (c.in_.n <= CAP) { prune_in_shared(c, lane); return; }
+    for (uint i = lane; i < c.in_.n; i += gl_WorkGroupSize.x) {
+        const uvec3 e = entry(c.in_, i);
+        if (P.nodes.v[2u * e.x] == NODE_PRIM) {
+            P.values.v[c.sbase + i] = eval_primitive(P.nodes.v[2u * e.x + 1u], c.center);
+            prim_evals++;
+        }
+    }
+    if (prim_evals > 0u) atomicAdd(P.counters.prim_evals, uint64_t(prim_evals));
+    memoryBarrierBuffer();
+    barrier();
+    if (lane != 0u) return;
+    const double value = local_state(c, true);
+    atomicAdd(P.counters.op_evals, uint64_t(op_evals));
+    if (!(abs(value) <= P.r_keep)) { if (c.static_surface) record_culled(c.cc); return; }
+    bool sphere;
+    const uint count = global_state(c, sphere);
+    if (!sphere) return;
+    const uint base = atomicAdd(P.counters.entries, count);
+    const uint k = atomicAdd(P.counters.cells, 1u);
+    atomicMax(P.counters.max_tree, count);
+    if (k >= P.cell_cap || base + count > P.entry_cap) return;
+    write_cell(k, c.cc, base, count);
+    write_tree(c, base, count);
+}
+#else
+void main() {
+    const uint tid = gl_GlobalInvocationID.x;
+    bool keep = false;
+    uint count = 0u, fstate = 0u;
+    Child c;
+    if (tid < 8u * P.args.v[6]) {
+        c = make_child(tid);
+        if (c.fast && c.in_.n <= P.wide) {
+            fstate = fast_state(c);
+            if (fstate == 0u) { if (c.static_surface) record_culled(c.cc); }
+            else if (fstate != 1u) { keep = true; count = fstate == 2u ? c.in_.n : 1u; }
+        } else if (c.in_.n <= P.wide) {
+            const double value = local_state(c, false);
+            if (!(abs(value) <= P.r_keep)) {
+                if (c.static_surface) record_culled(c.cc);
+            } else {
+                bool sphere;
+                count = global_state(c, sphere);
+                keep = sphere;
+            }
+        }
+    }
+    // Space in the output arrays, one atomic per subgroup (all invocations reach this point).
+    const uint want = keep ? count : 0u, want_cell = keep ? 1u : 0u;
+    const uint prefix = subgroupExclusiveAdd(want), total = subgroupAdd(want);
+    const uint cprefix = subgroupExclusiveAdd(want_cell), ctotal = subgroupAdd(want_cell);
+    const uint sub_prims = subgroupAdd(prim_evals), sub_ops = subgroupAdd(op_evals), sub_max = subgroupMax(want);
+    uint base = 0u, cbase = 0u;
+    if (subgroupElect()) {
+        if (total > 0u) base = atomicAdd(P.counters.entries, total);
+        if (ctotal > 0u) cbase = atomicAdd(P.counters.cells, ctotal);
+        if (sub_max > 0u) atomicMax(P.counters.max_tree, sub_max);
+        if ((sub_prims | sub_ops) != 0u) {
+            atomicAdd(P.counters.prim_evals, uint64_t(sub_prims));
+            atomicAdd(P.counters.op_evals, uint64_t(sub_ops));
+        }
+    }
+    base = subgroupBroadcastFirst(base) + prefix;
+    cbase = subgroupBroadcastFirst(cbase) + cprefix;
+    if (keep && (cbase >= P.cell_cap || base + count > P.entry_cap)) keep = false;  // see the WIDE kernel
+    if (keep) {
+        write_cell(cbase, c.cc, base, count);
+        if (fstate >= 2u) for (uint i = 0u; i < count; i++) write_fast(c, base, fstate, i);
+        else write_tree(c, base, count);
+    }
+}
+#endif

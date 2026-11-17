@@ -1,0 +1,25 @@
+// Dense grid of one level of the static octree: grid[cell] = index + 1 for the cells with surface,
+// (index + 1) | bit 31 for the cells proven empty (far), 0 where the octree has no cell.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+
+layout(push_constant) uniform PC {
+    U32 cells;  // 8 uints per cell: x, y, z, ...
+    U32 far;
+    U32 grid;
+    uint n_cells, n_far, n;  // n: cells per axis of the level
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n_cells + pc.n_far) return;
+    const bool is_far = i >= pc.n_cells;
+    const uint k = is_far ? i - pc.n_cells : i;
+    const uvec3 c = is_far ? uvec3(pc.far.v[8u * k], pc.far.v[8u * k + 1u], pc.far.v[8u * k + 2u])
+                           : uvec3(pc.cells.v[8u * k], pc.cells.v[8u * k + 1u], pc.cells.v[8u * k + 2u]);
+    pc.grid.v[(c.x * pc.n + c.y) * pc.n + c.z] = (k + 1u) | (is_far ? 0x80000000u : 0u);
+}

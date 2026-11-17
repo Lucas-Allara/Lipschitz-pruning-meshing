@@ -1,0 +1,13 @@
+{
+  "scene": "scenes/molecule.json", "method": "lipschitz", "depth": 8, "threads": 32, "inherit": true, "analytic": false, "dense": false,
+  "nodes": 2001, "prims": 1001, "ops": 1000, "tree_height": 1001,
+  "time_load": 0.004690, "time_octree": 0.179048, "time_mesh": 0.806509, "time_dense": 0.000000, "time_total": 1.123211,
+  "time_dc_index": 0.000000, "time_dc_corners": 0.000000, "time_dc_edges": 0.000000, "time_dc_qef": 0.000000, "time_dc_faces": 0.000000,
+  "octree_prim_evals": 0, "octree_op_evals": 0, "octree_prim_ivals": 0, "octree_op_ivals": 0,
+  "mesh_prim_evals": 35507328, "mesh_op_evals": 30714128,
+  "prim_evals": 35507328, "node_evals": 66221456,
+  "cells": 255699, "corners": 0, "crossings": 0, "vertices": 180272, "triangles": 360680, "analytic_hits": 0,
+  "pool_entries": 0, "pool_bytes": 0, "peak_rss_mb": 983.8,
+  "adaptive": {"tol": 0.1, "single_primitive_only": false, "min_depth": 3, "fine_leaves": 358333, "leaves": 255699, "collapsed": 15352, "time_hermite": 0.533791, "time_collapse": 0.186062, "time_faces": 0.086655, "leaves_per_level": [0, 0, 0, 0, 0, 0, 8, 15300, 240391]},
+  "levels": []
+}

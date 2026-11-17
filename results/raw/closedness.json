@@ -1,0 +1,17 @@
+{
+ "trees": {
+  "boundary": 0,
+  "nonmanifold": 0,
+  "triangles": 428612
+ },
+ "monument": {
+  "boundary": 0,
+  "nonmanifold": 19,
+  "triangles": 1179256
+ },
+ "molecule": {
+  "boundary": 0,
+  "nonmanifold": 3,
+  "triangles": 504440
+ }
+}
